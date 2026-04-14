@@ -48,6 +48,8 @@ const emptyForm: FormState = {
 }
 
 const normalizeBarcode = (value: string) => String(value || '').trim().replace(/\s+/g, '').replace(/-/g, '')
+const INVENTORY_CACHE_KEY = 'inventory_items_cache_v1'
+const CART_CACHE_KEY = 'inventory_cart_cache_v1'
 
 export default function InventoryPage() {
   const [items, setItems] = useState<InventoryItem[]>([])
@@ -91,8 +93,20 @@ export default function InventoryPage() {
       setLoading(true)
       const data = await listInventoryItems()
       setItems(data)
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(data))
+      }
     } catch (error: any) {
-      toast.error(error?.message || 'Failed to load items from Firebase')
+      const fallback =
+        typeof window !== 'undefined'
+          ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]')
+          : []
+      if (Array.isArray(fallback) && fallback.length) {
+        setItems(fallback)
+        toast.error('Firebase load failed. Showing cached items.')
+      } else {
+        toast.error(error?.message || 'Failed to load items from Firebase')
+      }
     } finally {
       setLoading(false)
     }
@@ -101,6 +115,19 @@ export default function InventoryPage() {
   useEffect(() => {
     loadItems()
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const cached = JSON.parse(localStorage.getItem(CART_CACHE_KEY) || '[]')
+    if (Array.isArray(cached) && cached.length) {
+      setCart(cached)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(CART_CACHE_KEY, JSON.stringify(cart))
+  }, [cart])
 
   const stopScanner = () => {
     if (intervalRef.current) {
@@ -204,13 +231,7 @@ export default function InventoryPage() {
       })
       .join('')
 
-    const popup = window.open('', '_blank', 'width=900,height=700')
-    if (!popup) {
-      toast.error('Popup blocked. Allow popups to print.')
-      return
-    }
-
-    popup.document.write(`
+    const html = `
       <html>
       <head><title>Inventory Bill</title></head>
       <body style="font-family:Arial,sans-serif;padding:16px;">
@@ -228,11 +249,48 @@ export default function InventoryPage() {
           <tbody>${lines}</tbody>
         </table>
         <h3 style="text-align:right;margin-top:12px;">Grand Total: Rs ${cartTotal.toFixed(2)}</h3>
-        <script>window.onload=function(){window.print();}</script>
       </body>
       </html>
-    `)
-    popup.document.close()
+    `
+
+    const popup = window.open('', '_blank', 'width=900,height=700')
+    if (popup) {
+      popup.document.write(html)
+      popup.document.close()
+      popup.onload = () => {
+        popup.focus()
+        popup.print()
+      }
+      return
+    }
+
+    // Mobile fallback for blocked popups: print through hidden iframe.
+    const iframe = document.createElement('iframe')
+    iframe.style.position = 'fixed'
+    iframe.style.right = '0'
+    iframe.style.bottom = '0'
+    iframe.style.width = '0'
+    iframe.style.height = '0'
+    iframe.style.border = '0'
+    document.body.appendChild(iframe)
+    const frameDoc = iframe.contentDocument || iframe.contentWindow?.document
+    if (!frameDoc) {
+      document.body.removeChild(iframe)
+      toast.error('Could not initialize print view')
+      return
+    }
+    frameDoc.open()
+    frameDoc.write(html)
+    frameDoc.close()
+    setTimeout(() => {
+      iframe.contentWindow?.focus()
+      iframe.contentWindow?.print()
+      setTimeout(() => {
+        if (document.body.contains(iframe)) {
+          document.body.removeChild(iframe)
+        }
+      }, 600)
+    }, 300)
   }
 
   const processScannedCode = (rawCode: string) => {
@@ -616,7 +674,16 @@ export default function InventoryPage() {
             )}
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="btn btn-secondary" onClick={() => setCart([])} disabled={cart.length === 0}>
+            <button
+              className="btn btn-secondary"
+              onClick={() => {
+                setCart([])
+                if (typeof window !== 'undefined') {
+                  localStorage.removeItem(CART_CACHE_KEY)
+                }
+              }}
+              disabled={cart.length === 0}
+            >
               Clear Cart
             </button>
             <button className="btn btn-primary" onClick={printBill} disabled={cart.length === 0}>

@@ -5,8 +5,6 @@ import {
   deleteDoc,
   doc,
   getDocs,
-  orderBy,
-  query,
   serverTimestamp,
   updateDoc,
 } from 'firebase/firestore'
@@ -28,8 +26,8 @@ const COLLECTION_NAME = 'inventory_items'
 const collectionRef = () => collection(getDb(), COLLECTION_NAME)
 
 export const listInventoryItems = async (): Promise<InventoryItem[]> => {
-  const snapshot = await getDocs(query(collectionRef(), orderBy('updatedAt', 'desc')))
-  return snapshot.docs.map((entry) => {
+  const snapshot = await getDocs(collectionRef())
+  const items = snapshot.docs.map((entry) => {
     const data = entry.data() as Omit<InventoryItem, 'id'>
     return {
       id: entry.id,
@@ -41,6 +39,11 @@ export const listInventoryItems = async (): Promise<InventoryItem[]> => {
       createdAt: data.createdAt || null,
       updatedAt: data.updatedAt || null,
     }
+  })
+  return items.sort((a, b) => {
+    const aTs = a.updatedAt?.toMillis?.() || a.createdAt?.toMillis?.() || 0
+    const bTs = b.updatedAt?.toMillis?.() || b.createdAt?.toMillis?.() || 0
+    return bTs - aTs
   })
 }
 
