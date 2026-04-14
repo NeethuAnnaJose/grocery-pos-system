@@ -1,0 +1,10 @@
+{
+  "name": "Grocery POS Scanner",
+  "short_name": "GroceryPOS",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f3f4f6",
+  "theme_color": "#2563eb",
+  "description": "Responsive grocery POS and barcode scanning app.",
+  "icons": []
+}

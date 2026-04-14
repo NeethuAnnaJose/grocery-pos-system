@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: grocery-pos-backend
+    env: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install && npm run generate && npx prisma migrate deploy
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5001
+      - key: DATABASE_URL
+        fromDatabase:
+          name: grocery-pos-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: FRONTEND_URL
+        value: https://grocery-pos-frontend.onrender.com
+
+  - type: web
+    name: grocery-pos-frontend
+    env: node
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: next start -H 0.0.0.0 -p $PORT
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_API_URL
+        value: https://grocery-pos-backend.onrender.com
+
+databases:
+  - name: grocery-pos-db
+    plan: free

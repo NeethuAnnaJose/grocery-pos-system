@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Login</title>
+</head>
+<body>
+    <h1>Debug Login</h1>
+    <form id="loginForm">
+        <div>
+            <label>Email:</label>
+            <input type="email" id="email" value="admin@shop.com" required>
+        </div>
+        <div>
+            <label>Password:</label>
+            <input type="password" id="password" value="admin123" required>
+        </div>
+        <button type="submit">Login</button>
+    </form>
+    
+    <div id="result"></div>
+    
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const result = document.getElementById('result');
+            
+            try {
+                result.innerHTML = 'Logging in...';
+                
+                const response = await fetch('http://localhost:5001/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.token) {
+                    result.innerHTML = `
+                        <h3>Login Successful!</h3>
+                        <p>Token: ${data.token.substring(0, 20)}...</p>
+                        <p>User: ${data.user.name} (${data.user.role})</p>
+                        <button onclick="testToken()">Test Token</button>
+                    `;
+                    localStorage.setItem('token', data.token);
+                } else {
+                    result.innerHTML = `<h3>Login Failed!</h3><p>${data.message || 'Unknown error'}</p>`;
+                }
+            } catch (error) {
+                result.innerHTML = `<h3>Network Error!</h3><p>${error.message}</p>`;
+            }
+        });
+        
+        async function testToken() {
+            const token = localStorage.getItem('token');
+            const result = document.getElementById('result');
+            
+            try {
+                result.innerHTML = 'Testing token...';
+                
+                const response = await fetch('http://localhost:5001/api/auth/me', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    result.innerHTML = `
+                        <h3>Token Valid!</h3>
+                        <p>User: ${data.user.name} (${data.user.role})</p>
+                        <a href="http://localhost:3000" target="_blank">Go to App</a>
+                    `;
+                } else {
+                    result.innerHTML = `<h3>Token Invalid!</h3><p>${data.message || 'Unknown error'}</p>`;
+                }
+            } catch (error) {
+                result.innerHTML = `<h3>Token Test Error!</h3><p>${error.message}</p>`;
+            }
+        }
+    </script>
+</body>
+</html>

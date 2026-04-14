@@ -1,0 +1,193 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      String @default("STAFF")
+  phone     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  orders    Order[]
+  inventoryLogs InventoryLog[]
+
+  @@map("users")
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String   @unique
+  email     String?
+  address   String?
+  creditLimit Float @default(0)
+  currentBalance Float @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  orders    Order[]
+  payments  Payment[]
+
+  @@map("customers")
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  items      Item[]
+
+  @@map("categories")
+}
+
+model Item {
+  id          String   @id @default(cuid())
+  name        String
+  barcode     String?  @unique
+  sku         String?  @unique
+  description String?
+  categoryId  String
+  price       Float
+  costPrice   Float
+  quantity    Int      @default(0)
+  minQuantity Int      @default(5)
+  unit        String   @default("pcs")
+  hsnCode     String?
+  gstRate     Float    @default(0)
+  expiryDate  DateTime?
+  batchNumber String?
+  supplier    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  category     Category     @relation(fields: [categoryId], references: [id])
+  orderItems   OrderItem[]
+  inventoryLogs InventoryLog[]
+
+  @@map("items")
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  invoiceNumber String      @unique
+  customerId    String?
+  userId        String
+  subtotal      Float
+  discount      Float       @default(0)
+  gstAmount     Float       @default(0)
+  totalAmount   Float
+  paymentMethod String @default("CASH")
+  paymentStatus String @default("PENDING")
+  orderStatus   String @default("PENDING")
+  notes         String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  // Relations
+  customer   Customer?   @relation(fields: [customerId], references: [id])
+  user       User        @relation(fields: [userId], references: [id])
+  orderItems OrderItem[]
+  payments   Payment[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String @id @default(cuid())
+  orderId     String
+  itemId      String
+  quantity    Int
+  price       Float
+  discount    Float  @default(0)
+  gstRate     Float  @default(0)
+  gstAmount   Float  @default(0)
+  totalAmount Float
+
+  // Relations
+  order Order @relation(fields: [orderId], references: [id])
+  item  Item  @relation(fields: [itemId], references: [id])
+
+  @@map("order_items")
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  orderId       String
+  customerId    String?
+  amount        Float
+  paymentMethod String
+  paymentType   String @default("PAYMENT")
+  status        String @default("PENDING")
+  transactionId String?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Relations
+  order   Order    @relation(fields: [orderId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id])
+
+  @@map("payments")
+}
+
+model InventoryLog {
+  id        String           @id @default(cuid())
+  itemId    String
+  userId    String
+  type      String
+  quantity  Int
+  quantityBefore Int
+  quantityAfter  Int
+  reason    String?
+  createdAt DateTime        @default(now())
+
+  // Relations
+  item Item @relation(fields: [itemId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("inventory_logs")
+}
+
+model Alert {
+  id        String     @id @default(cuid())
+  type      String
+  itemId    String?
+  message   String
+  isRead    Boolean    @default(false)
+  createdAt DateTime   @default(now())
+
+  @@map("alerts")
+}
+
+model Settings {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
