@@ -34,7 +34,12 @@ api.interceptors.response.use(
     if (error.response?.status === 401) {
       const url = String(error.config?.url || '')
       // Do not redirect on failed login/register (same page, wrong password)
-      if (!url.includes('/auth/login') && !url.includes('/auth/register')) {
+      if (
+        !url.includes('/auth/login') &&
+        !url.includes('/auth/register') &&
+        !url.includes('/auth/forgot-password') &&
+        !url.includes('/auth/reset-password')
+      ) {
         localStorage.removeItem('token')
         if (typeof window !== 'undefined') {
           Router.replace('/login').catch(() => {})
@@ -64,6 +69,10 @@ export const authAPI = {
     currentPassword: string
     newPassword: string
   }) => api.put('/auth/change-password', passwordData),
+  forgotPassword: (payload: { email: string }) =>
+    api.post('/auth/forgot-password', payload),
+  resetPassword: (payload: { token: string; newPassword: string }) =>
+    api.post('/auth/reset-password', payload),
 }
 
 // Items API

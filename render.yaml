@@ -10,8 +10,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 5001
       - key: DATABASE_URL
         fromDatabase:
           name: grocery-pos-db
@@ -29,7 +27,7 @@ services:
     plan: free
     rootDir: frontend
     buildCommand: npm install && npm run build
-    startCommand: next start -H 0.0.0.0 -p $PORT
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
