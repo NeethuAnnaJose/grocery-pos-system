@@ -48,6 +48,24 @@ const emptyForm: FormState = {
 }
 
 const normalizeBarcode = (value: string) => String(value || '').trim().replace(/\s+/g, '').replace(/-/g, '')
+const barcodeCandidates = (value: string) => {
+  const normalized = normalizeBarcode(value)
+  if (!normalized) return []
+  const candidates = new Set<string>([normalized, normalized.toUpperCase()])
+  if (/^\d+$/.test(normalized)) {
+    const noLeadingZero = normalized.replace(/^0+/, '') || '0'
+    candidates.add(noLeadingZero)
+    if (normalized.length === 12) candidates.add(`0${normalized}`)
+    if (normalized.length === 13 && normalized.startsWith('0')) candidates.add(normalized.slice(1))
+  }
+  return Array.from(candidates)
+}
+
+const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
+  const itemCodes = new Set(barcodeCandidates(item.barcode || ''))
+  if (!itemCodes.size) return false
+  return barcodeCandidates(scannedValue).some((candidate) => itemCodes.has(candidate))
+}
 const INVENTORY_CACHE_KEY = 'inventory_items_cache_v1'
 const CART_CACHE_KEY = 'inventory_cart_cache_v1'
 
@@ -304,7 +322,7 @@ export default function InventoryPage() {
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
-    const match = items.find((item) => normalizeBarcode(item.barcode) === code)
+    const match = items.find((item) => itemMatchesBarcode(item, code))
     if (match) {
       setScanHistory((prev) => [{ code, name: match.name, scannedAt: now }, ...prev].slice(0, 20))
       addToCart(match)

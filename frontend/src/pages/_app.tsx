@@ -12,13 +12,10 @@ function MyApp({ Component, pageProps }: AppProps) {
     if (typeof window === 'undefined' || !('serviceWorker' in navigator)) {
       return
     }
-    if (process.env.NODE_ENV !== 'production') {
-      navigator.serviceWorker.getRegistrations().then((registrations) => {
-        registrations.forEach((registration) => registration.unregister())
-      }).catch(() => {})
-      return
-    }
-    navigator.serviceWorker.register('/sw.js').catch(() => {})
+    // Disable service worker registration to avoid stale caches on live updates.
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      registrations.forEach((registration) => registration.unregister())
+    }).catch(() => {})
   }, [])
 
   return (
