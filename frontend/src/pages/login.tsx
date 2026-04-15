@@ -8,9 +8,58 @@ import {
   signInWithEmailAndPassword,
   updateProfile,
 } from 'firebase/auth'
-import { getFirebaseAuth } from '@/lib/firebase'
+import { getFirebaseAuth, hasFirebaseConfig } from '@/lib/firebase'
 
 type AuthView = 'SIGN_IN' | 'REGISTER' | 'FORGOT'
+
+const getAuthErrorMessage = (error: any) => {
+  const code = String(error?.code || '')
+  if (code.includes('auth/operation-not-allowed')) {
+    return 'Registration is disabled in Firebase. Enable Email/Password sign-in in Firebase Console.'
+  }
+  if (code.includes('auth/email-already-in-use')) {
+    return 'This email is already registered. Please sign in instead.'
+  }
+  if (code.includes('auth/invalid-email')) {
+    return 'Please enter a valid email address.'
+  }
+  if (code.includes('auth/weak-password')) {
+    return 'Password is too weak. Use at least 6 characters.'
+  }
+  if (code.includes('auth/network-request-failed')) {
+    return 'Network error. Check internet and try again.'
+  }
+  if (code.includes('auth/invalid-credential') || code.includes('auth/wrong-password')) {
+    return 'Invalid email or password.'
+  }
+  if (code.includes('auth/user-not-found')) {
+    return 'Account not found. Please register first.'
+  }
+  if (code.includes('auth/too-many-requests')) {
+    return 'Too many attempts. Please wait and try again.'
+  }
+  return error?.message || 'Authentication failed'
+}
+
+type LocalUser = {
+  name: string
+  email: string
+  password: string
+}
+
+const LOCAL_USERS_KEY = 'local_auth_users_v1'
+const LOCAL_SESSION_KEY = 'local_auth_session_v1'
+
+const getLocalUsers = (): LocalUser[] => {
+  if (typeof window === 'undefined') return []
+  const parsed = JSON.parse(localStorage.getItem(LOCAL_USERS_KEY) || '[]')
+  return Array.isArray(parsed) ? parsed : []
+}
+
+const saveLocalUsers = (users: LocalUser[]) => {
+  if (typeof window === 'undefined') return
+  localStorage.setItem(LOCAL_USERS_KEY, JSON.stringify(users))
+}
 
 export default function Login() {
   const router = useRouter()
@@ -21,6 +70,13 @@ export default function Login() {
   const [forgotEmail, setForgotEmail] = useState('')
 
   useEffect(() => {
+    if (!hasFirebaseConfig) {
+      const session = typeof window !== 'undefined' ? localStorage.getItem(LOCAL_SESSION_KEY) : ''
+      if (session) {
+        router.replace('/billing').catch(() => {})
+      }
+      return
+    }
     try {
       const auth = getFirebaseAuth()
       return onAuthStateChanged(auth, (user) => {
@@ -41,12 +97,26 @@ export default function Login() {
     }
     setIsSubmitting(true)
     try {
+      if (!hasFirebaseConfig) {
+        const email = signInForm.email.trim().toLowerCase()
+        const users = getLocalUsers()
+        const match = users.find((entry) => entry.email === email && entry.password === signInForm.password)
+        if (!match) {
+          toast.error('Invalid email or password.')
+          return
+        }
+        localStorage.setItem(LOCAL_SESSION_KEY, email)
+        toast.success('Signed in')
+        router.push('/billing').catch(() => {})
+        return
+      }
+
       const auth = getFirebaseAuth()
-      await signInWithEmailAndPassword(auth, signInForm.email.trim(), signInForm.password)
+      await signInWithEmailAndPassword(auth, signInForm.email.trim().toLowerCase(), signInForm.password)
       toast.success('Signed in')
       router.push('/billing').catch(() => {})
     } catch (error: any) {
-      toast.error(error?.message || 'Sign in failed')
+      toast.error(getAuthErrorMessage(error))
     } finally {
       setIsSubmitting(false)
     }
@@ -65,17 +135,39 @@ export default function Login() {
 
     setIsSubmitting(true)
     try {
+      if (!hasFirebaseConfig) {
+        const email = registerForm.email.trim().toLowerCase()
+        const users = getLocalUsers()
+        if (users.some((entry) => entry.email === email)) {
+          toast.error('This email is already registered. Please sign in instead.')
+          return
+        }
+        const nextUsers = [
+          ...users,
+          {
+            name: registerForm.name.trim(),
+            email,
+            password: registerForm.password,
+          },
+        ]
+        saveLocalUsers(nextUsers)
+        localStorage.setItem(LOCAL_SESSION_KEY, email)
+        toast.success('Account created')
+        router.push('/billing').catch(() => {})
+        return
+      }
+
       const auth = getFirebaseAuth()
       const credentials = await createUserWithEmailAndPassword(
         auth,
-        registerForm.email.trim(),
+        registerForm.email.trim().toLowerCase(),
         registerForm.password
       )
       await updateProfile(credentials.user, { displayName: registerForm.name.trim() })
       toast.success('Account created')
       router.push('/billing').catch(() => {})
     } catch (error: any) {
-      toast.error(error?.message || 'Registration failed')
+      toast.error(getAuthErrorMessage(error))
     } finally {
       setIsSubmitting(false)
     }
@@ -89,12 +181,27 @@ export default function Login() {
     }
     setIsSubmitting(true)
     try {
+      if (!hasFirebaseConfig) {
+        const email = forgotEmail.trim().toLowerCase()
+        const users = getLocalUsers()
+        const index = users.findIndex((entry) => entry.email === email)
+        if (index < 0) {
+          toast.error('Account not found. Please register first.')
+          return
+        }
+        users[index] = { ...users[index], password: '123456' }
+        saveLocalUsers(users)
+        toast.success('Password reset to 123456 (local mode). Please sign in and change it.')
+        setView('SIGN_IN')
+        return
+      }
+
       const auth = getFirebaseAuth()
-      await sendPasswordResetEmail(auth, forgotEmail.trim())
+      await sendPasswordResetEmail(auth, forgotEmail.trim().toLowerCase())
       toast.success('Password reset email sent')
       setView('SIGN_IN')
     } catch (error: any) {
-      toast.error(error?.message || 'Failed to send reset email')
+      toast.error(getAuthErrorMessage(error))
     } finally {
       setIsSubmitting(false)
     }
@@ -105,6 +212,11 @@ export default function Login() {
       <div className="bg-white rounded-lg shadow p-6 w-full max-w-md">
         <h1 className="text-xl font-semibold mb-1 text-center">Shop Counter Login</h1>
         <p className="text-sm text-gray-600 mb-4 text-center">Sign in to manage inventory and billing</p>
+        {!hasFirebaseConfig ? (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
+            Firebase keys are missing. Using local auth mode for now.
+          </p>
+        ) : null}
 
         <div className="grid grid-cols-3 gap-2 mb-4">
           <button

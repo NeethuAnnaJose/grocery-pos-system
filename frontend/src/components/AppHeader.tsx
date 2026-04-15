@@ -2,7 +2,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/router'
 import toast from 'react-hot-toast'
 import { signOut } from 'firebase/auth'
-import { getFirebaseAuth } from '@/lib/firebase'
+import { getFirebaseAuth, hasFirebaseConfig } from '@/lib/firebase'
 
 type AppHeaderProps = {
   active: 'inventory' | 'billing'
@@ -14,7 +14,11 @@ export const AppHeader = ({ active, userEmail }: AppHeaderProps) => {
 
   const handleLogout = async () => {
     try {
-      await signOut(getFirebaseAuth())
+      if (hasFirebaseConfig) {
+        await signOut(getFirebaseAuth())
+      } else if (typeof window !== 'undefined') {
+        localStorage.removeItem('local_auth_session_v1')
+      }
       toast.success('Signed out')
       router.push('/login').catch(() => {})
     } catch (error: any) {

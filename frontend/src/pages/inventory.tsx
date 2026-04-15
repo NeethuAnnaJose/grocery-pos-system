@@ -62,7 +62,7 @@ const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
 }
 
 export default function InventoryPage() {
-  const { authLoading, currentUser } = useRequireAuth()
+  const { authLoading, currentUserEmail } = useRequireAuth()
   const [items, setItems] = useState<InventoryItem[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -370,7 +370,7 @@ export default function InventoryPage() {
 
   return (
     <div className="min-h-screen bg-gray-100">
-      <AppHeader active="inventory" userEmail={currentUser?.email || undefined} />
+      <AppHeader active="inventory" userEmail={currentUserEmail || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
         <section className="bg-white rounded-lg shadow p-4">

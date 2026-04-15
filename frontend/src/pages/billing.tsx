@@ -50,7 +50,7 @@ const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
 }
 
 export default function BillingPage() {
-  const { authLoading, currentUser } = useRequireAuth()
+  const { authLoading, currentUserEmail } = useRequireAuth()
   const [items, setItems] = useState<InventoryItem[]>([])
   const [cart, setCart] = useState<CartEntry[]>([])
   const [manualEntry, setManualEntry] = useState('')
@@ -438,7 +438,7 @@ export default function BillingPage() {
 
   return (
     <div className="min-h-screen bg-gray-100">
-      <AppHeader active="billing" userEmail={currentUser?.email || undefined} />
+      <AppHeader active="billing" userEmail={currentUserEmail || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
         <section className="bg-white rounded-lg shadow p-4">
