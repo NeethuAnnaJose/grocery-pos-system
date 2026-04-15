@@ -330,7 +330,12 @@ export default function InventoryPage() {
         cacheItems(next)
         toast.success('Item updated')
       } catch (error: any) {
-        toast.error(error?.message || 'Failed to update item')
+        // Keep local cache updated even when Firebase is unavailable.
+        const next = items.map((item) =>
+          item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
+        )
+        cacheItems(next)
+        toast.error(error?.message || 'Firebase update failed. Updated locally.')
       }
     } else {
       try {
@@ -338,7 +343,19 @@ export default function InventoryPage() {
         cacheItems([created, ...items])
         toast.success('Item added')
       } catch (error: any) {
-        toast.error(error?.message || 'Failed to add item')
+        // Keep local cache updated even when Firebase is unavailable.
+        const localItem: InventoryItem = {
+          id: `local-${Date.now()}`,
+          name,
+          barcode,
+          price,
+          quantity,
+          unit,
+          createdAt: null,
+          updatedAt: null,
+        }
+        cacheItems([localItem, ...items])
+        toast.error(error?.message || 'Firebase add failed. Saved locally.')
       }
     }
 
@@ -360,7 +377,12 @@ export default function InventoryPage() {
       }
       toast.success('Item deleted')
     } catch (error: any) {
-      toast.error(error?.message || 'Failed to delete item')
+      cacheItems(items.filter((entry) => entry.id !== itemId))
+      if (editingId === itemId) {
+        setEditingId(null)
+        setForm(emptyForm)
+      }
+      toast.error(error?.message || 'Firebase delete failed. Removed locally.')
     }
   }
 

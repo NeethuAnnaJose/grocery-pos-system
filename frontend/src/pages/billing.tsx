@@ -30,15 +30,27 @@ const normalizeBarcode = (value: string) =>
     .replace(/\s+/g, '')
     .replace(/-/g, '')
 
+const digitsOnly = (value: string) => String(value || '').replace(/\D/g, '')
+
 const barcodeCandidates = (value: string) => {
   const normalized = normalizeBarcode(value)
   if (!normalized) return []
   const candidates = new Set<string>([normalized, normalized.toUpperCase()])
+  const digits = digitsOnly(normalized)
+  if (digits) {
+    candidates.add(digits)
+  }
   if (/^\d+$/.test(normalized)) {
     const noLeadingZero = normalized.replace(/^0+/, '') || '0'
     candidates.add(noLeadingZero)
     if (normalized.length === 12) candidates.add(`0${normalized}`)
     if (normalized.length === 13 && normalized.startsWith('0')) candidates.add(normalized.slice(1))
+  }
+  if (digits) {
+    const noLeadingZero = digits.replace(/^0+/, '') || '0'
+    candidates.add(noLeadingZero)
+    if (digits.length === 12) candidates.add(`0${digits}`)
+    if (digits.length === 13 && digits.startsWith('0')) candidates.add(digits.slice(1))
   }
   return Array.from(candidates)
 }
@@ -46,7 +58,20 @@ const barcodeCandidates = (value: string) => {
 const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
   const itemCodes = new Set(barcodeCandidates(item.barcode || ''))
   if (!itemCodes.size) return false
-  return barcodeCandidates(scannedValue).some((candidate) => itemCodes.has(candidate))
+  const scannedCandidates = barcodeCandidates(scannedValue)
+  if (scannedCandidates.some((candidate) => itemCodes.has(candidate))) {
+    return true
+  }
+
+  // Additional tolerance: scanners may include prefixes/suffixes around numeric barcode payload.
+  const scannedDigits = digitsOnly(scannedValue)
+  const itemDigits = digitsOnly(item.barcode || '')
+  if (!scannedDigits || !itemDigits) return false
+  if (scannedDigits === itemDigits) return true
+  if (scannedDigits.length >= 8 && itemDigits.length >= 8) {
+    return scannedDigits.endsWith(itemDigits) || itemDigits.endsWith(scannedDigits)
+  }
+  return false
 }
 
 export default function BillingPage() {
@@ -231,10 +256,19 @@ export default function BillingPage() {
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
-    const match = items.find((item) => itemMatchesBarcode(item, code))
+    let sourceItems = items
+    if (!sourceItems.length && typeof window !== 'undefined') {
+      const cached = JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]')
+      if (Array.isArray(cached) && cached.length) {
+        sourceItems = cached as InventoryItem[]
+        setItems(cached as InventoryItem[])
+      }
+    }
+
+    const match = sourceItems.find((item) => itemMatchesBarcode(item, code))
     if (!match) {
       setScanStatus(`Not found: ${code}`)
-      toast.error(`Item not found for ${code}`)
+      toast.error(`Item not found for ${code}. Tap "Refresh Inventory Source" once.`)
       return
     }
 
