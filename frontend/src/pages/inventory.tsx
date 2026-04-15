@@ -39,6 +39,8 @@ type CartEntry = {
   unit: string
 }
 
+type ScannerMode = 'CART' | 'INVENTORY'
+
 const emptyForm: FormState = {
   name: '',
   barcode: '',
@@ -77,6 +79,7 @@ export default function InventoryPage() {
   const [editingId, setEditingId] = useState<string | null>(null)
 
   const [showScanner, setShowScanner] = useState(false)
+  const [scannerMode, setScannerMode] = useState<ScannerMode>('CART')
   const [preferredFacingMode, setPreferredFacingMode] = useState<'environment' | 'user'>('environment')
   const [rearVideoInputs, setRearVideoInputs] = useState<Array<{ id: string; label: string }>>([])
   const [selectedRearDeviceId, setSelectedRearDeviceId] = useState('')
@@ -325,19 +328,29 @@ export default function InventoryPage() {
     const match = items.find((item) => itemMatchesBarcode(item, code))
     if (match) {
       setScanHistory((prev) => [{ code, name: match.name, scannedAt: now }, ...prev].slice(0, 20))
-      addToCart(match)
-      setScanStatus(`Added to cart: ${match.name}`)
-      toast.success(`Added to cart: ${match.name}`)
-      closeScanner()
+      if (scannerMode === 'CART') {
+        addToCart(match)
+        setScanStatus(`Added to cart: ${match.name}`)
+        toast.success(`Added to cart: ${match.name}`)
+      } else {
+        setScanStatus(`Matched: ${match.name}`)
+        toast.success(`Matched item: ${match.name}`)
+      }
       return
     }
 
     setForm((prev) => ({ ...prev, barcode: code }))
     setEditingId(null)
     setScanHistory((prev) => [{ code, name: 'New barcode', scannedAt: now }, ...prev].slice(0, 20))
-    setScanStatus(`Captured new barcode: ${code}`)
+    setScanStatus(
+      scannerMode === 'CART'
+        ? `New barcode ${code}. Fill details and use "Add Item + Cart".`
+        : `Captured new barcode: ${code}`
+    )
     toast.success(`Captured: ${code}`)
-    closeScanner()
+    if (scannerMode !== 'CART') {
+      closeScanner()
+    }
   }
 
   const startScanner = async (facingMode: 'environment' | 'user' = preferredFacingMode) => {
@@ -497,7 +510,7 @@ export default function InventoryPage() {
     }
   }
 
-  const handleSave = async () => {
+  const handleSave = async (addNewToCart = false) => {
     const name = form.name.trim()
     const barcode = normalizeBarcode(form.barcode)
     const price = Number(form.price)
@@ -514,8 +527,13 @@ export default function InventoryPage() {
         await updateInventoryItem(editingId, { name, barcode, price, quantity, unit })
         toast.success('Item updated')
       } else {
-        await createInventoryItem({ name, barcode, price, quantity, unit })
-        toast.success('Item created')
+        const created = await createInventoryItem({ name, barcode, price, quantity, unit })
+        if (addNewToCart && created) {
+          addToCart(created)
+          toast.success('Item created and added to cart')
+        } else {
+          toast.success('Item created')
+        }
       }
       setForm(emptyForm)
       setEditingId(null)
@@ -562,6 +580,30 @@ export default function InventoryPage() {
 
       <div className="max-w-6xl mx-auto px-4 py-6 space-y-4">
         <div className="bg-white rounded-lg shadow p-4">
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              className={`py-2 rounded text-sm font-semibold ${scannerMode === 'CART' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              onClick={() => setScannerMode('CART')}
+            >
+              Billing Scan Mode
+            </button>
+            <button
+              type="button"
+              className={`py-2 rounded text-sm font-semibold ${scannerMode === 'INVENTORY' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              onClick={() => setScannerMode('INVENTORY')}
+            >
+              Inventory Scan Mode
+            </button>
+          </div>
+          <p className="text-xs text-gray-600 mt-2">
+            {scannerMode === 'CART'
+              ? 'Scan item -> automatically adds to cart. Keep scanner open for next item.'
+              : 'Scan item -> fill inventory form for add/edit.'}
+          </p>
+        </div>
+
+        <div className="bg-white rounded-lg shadow p-4">
           <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
             <input
               className="input md:col-span-2"
@@ -602,9 +644,14 @@ export default function InventoryPage() {
             <button className="btn btn-secondary" onClick={() => { setForm(emptyForm); setEditingId(null) }}>
               Clear
             </button>
-            <button className="btn btn-primary md:col-span-2" onClick={handleSave}>
+            <button className="btn btn-primary md:col-span-2" onClick={() => { void handleSave(false) }}>
               {editingId ? 'Update Item' : 'Add Item'}
             </button>
+            {!editingId && (
+              <button className="btn btn-primary md:col-span-2" onClick={() => { void handleSave(true) }}>
+                Add Item + Cart
+              </button>
+            )}
             <button
               className="btn btn-secondary md:col-span-2"
               onClick={() => {
@@ -612,7 +659,7 @@ export default function InventoryPage() {
                 setTimeout(() => startScanner(), 0)
               }}
             >
-              Open Scanner
+              Open Scanner ({scannerMode === 'CART' ? 'Cart' : 'Inventory'})
             </button>
           </div>
         </div>
@@ -728,7 +775,7 @@ export default function InventoryPage() {
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-lg shadow-xl w-full max-w-md p-4">
             <div className="flex justify-between items-center mb-2">
-              <h3 className="font-semibold">Scan Barcode</h3>
+              <h3 className="font-semibold">Scan Barcode ({scannerMode === 'CART' ? 'Cart' : 'Inventory'})</h3>
               <div className="flex gap-2">
                 {preferredFacingMode === 'environment' && rearVideoInputs.length > 1 && (
                   <button

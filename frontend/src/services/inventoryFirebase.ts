@@ -54,11 +54,17 @@ export const createInventoryItem = async (payload: {
   quantity: number
   unit: string
 }) => {
-  await addDoc(collectionRef(), {
+  const docRef = await addDoc(collectionRef(), {
     ...payload,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
+  return {
+    id: docRef.id,
+    ...payload,
+    createdAt: null,
+    updatedAt: null,
+  } as InventoryItem
 }
 
 export const updateInventoryItem = async (
