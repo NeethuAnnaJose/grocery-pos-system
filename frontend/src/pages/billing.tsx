@@ -10,31 +10,19 @@ import {
 } from '@zxing/library'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
-import {
-  InventoryItem,
-  createInventoryItem,
-  deleteInventoryItem,
-  listInventoryItems,
-  updateInventoryItem,
-} from '@/services/inventoryFirebase'
+import { InventoryItem, listInventoryItems } from '@/services/inventoryFirebase'
 
-type FormState = {
+type CartEntry = {
+  id: string
   name: string
   barcode: string
-  price: string
-  quantity: string
+  price: number
+  quantity: number
   unit: string
 }
 
 const INVENTORY_CACHE_KEY = 'inventory_items_cache_v1'
-
-const emptyForm: FormState = {
-  name: '',
-  barcode: '',
-  price: '',
-  quantity: '1',
-  unit: 'pcs',
-}
+const CART_CACHE_KEY = 'billing_cart_cache_v1'
 
 const normalizeBarcode = (value: string) =>
   String(value || '')
@@ -61,13 +49,12 @@ const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
   return barcodeCandidates(scannedValue).some((candidate) => itemCodes.has(candidate))
 }
 
-export default function InventoryPage() {
+export default function BillingPage() {
   const { authLoading, currentUser } = useRequireAuth()
   const [items, setItems] = useState<InventoryItem[]>([])
+  const [cart, setCart] = useState<CartEntry[]>([])
+  const [manualEntry, setManualEntry] = useState('')
   const [loading, setLoading] = useState(true)
-  const [search, setSearch] = useState('')
-  const [form, setForm] = useState<FormState>(emptyForm)
-  const [editingId, setEditingId] = useState<string | null>(null)
 
   const [showScanner, setShowScanner] = useState(false)
   const [scanStatus, setScanStatus] = useState('')
@@ -83,34 +70,27 @@ export default function InventoryPage() {
   const lastScanAtRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
 
-  const filteredItems = useMemo(() => {
-    const key = search.trim().toLowerCase()
-    if (!key) return items
-    return items.filter(
-      (item) => item.name.toLowerCase().includes(key) || item.barcode.toLowerCase().includes(key)
-    )
-  }, [items, search])
-
-  const cacheItems = (nextItems: InventoryItem[]) => {
-    setItems(nextItems)
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(nextItems))
-    }
-  }
+  const cartTotal = useMemo(
+    () => cart.reduce((sum, entry) => sum + Number(entry.price || 0) * Number(entry.quantity || 0), 0),
+    [cart]
+  )
 
   const loadItems = async () => {
     try {
       setLoading(true)
       const data = await listInventoryItems()
-      cacheItems(data)
-    } catch (error: any) {
+      setItems(data)
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(data))
+      }
+    } catch {
       const fallback =
         typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]') : []
-      if (Array.isArray(fallback) && fallback.length) {
+      if (Array.isArray(fallback)) {
         setItems(fallback)
-        toast.error('Firebase load failed. Showing cached items.')
+        toast.error('Using cached inventory for billing')
       } else {
-        toast.error(error?.message || 'Failed to load inventory')
+        toast.error('Failed to load inventory')
       }
     } finally {
       setLoading(false)
@@ -120,6 +100,19 @@ export default function InventoryPage() {
   useEffect(() => {
     loadItems()
   }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const cached = JSON.parse(localStorage.getItem(CART_CACHE_KEY) || '[]')
+    if (Array.isArray(cached)) {
+      setCart(cached)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(CART_CACHE_KEY, JSON.stringify(cart))
+  }, [cart])
 
   const stopScanner = () => {
     if (intervalRef.current) {
@@ -173,37 +166,81 @@ export default function InventoryPage() {
     }
   }
 
+  const addToCart = (item: InventoryItem) => {
+    setCart((prev) => {
+      const existing = prev.find((entry) => entry.id === item.id)
+      if (existing) {
+        return prev.map((entry) =>
+          entry.id === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry
+        )
+      }
+      return [
+        ...prev,
+        {
+          id: item.id,
+          name: item.name,
+          barcode: item.barcode,
+          price: Number(item.price || 0),
+          quantity: 1,
+          unit: item.unit || 'pcs',
+        },
+      ]
+    })
+  }
+
+  const addToBillByQuery = (query: string) => {
+    const value = query.trim()
+    if (!value) return
+
+    const normalized = normalizeBarcode(value)
+    const barcodeMatches = items.filter((item) => itemMatchesBarcode(item, normalized))
+    if (barcodeMatches.length > 0) {
+      addToCart(barcodeMatches[0])
+      toast.success(`Added: ${barcodeMatches[0].name}`)
+      return
+    }
+
+    const lowered = value.toLowerCase()
+    const exactName = items.find((item) => item.name.trim().toLowerCase() === lowered)
+    if (exactName) {
+      addToCart(exactName)
+      toast.success(`Added: ${exactName.name}`)
+      return
+    }
+
+    const contains = items.filter((item) => item.name.toLowerCase().includes(lowered))
+    if (contains.length === 1) {
+      addToCart(contains[0])
+      toast.success(`Added: ${contains[0].name}`)
+      return
+    }
+    if (contains.length > 1) {
+      toast.error('Multiple items matched. Enter exact barcode or full name.')
+      return
+    }
+
+    toast.error('Item not found in inventory. Add it in Inventory section first.')
+  }
+
   const processScannedCode = (rawCode: string) => {
     const code = normalizeBarcode(rawCode)
     if (!code) return
 
     const now = Date.now()
-    if (lastScannedRef.current === code && now - lastScanAtRef.current < 1200) return
-
+    if (lastScannedRef.current === code && now - lastScanAtRef.current < 900) return
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
     const match = items.find((item) => itemMatchesBarcode(item, code))
-    if (match) {
-      setEditingId(match.id)
-      setForm({
-        name: match.name,
-        barcode: match.barcode,
-        price: String(match.price),
-        quantity: String(match.quantity),
-        unit: match.unit || 'pcs',
-      })
-      setScanStatus(`Matched existing item: ${match.name}`)
-      toast.success(`Loaded: ${match.name}`)
-      closeScanner()
+    if (!match) {
+      setScanStatus(`Not found: ${code}`)
+      toast.error(`Item not found for ${code}`)
       return
     }
 
-    setEditingId(null)
-    setForm((prev) => ({ ...prev, barcode: code }))
-    setScanStatus(`Captured barcode: ${code}`)
-    toast.success(`Captured: ${code}`)
-    closeScanner()
+    addToCart(match)
+    setScanStatus(`Added to bill: ${match.name}`)
+    toast.success(`Added: ${match.name}`)
   }
 
   const decodeWithCanvas = async () => {
@@ -289,7 +326,6 @@ export default function InventoryPage() {
               height: { ideal: 1080 },
             },
       }
-
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
       if (videoRef.current) {
@@ -301,7 +337,7 @@ export default function InventoryPage() {
       intervalRef.current = setInterval(() => {
         decodeWithCanvas().catch(() => {})
       }, 220)
-      setScanStatus('Scanner is active')
+      setScanStatus('Scanner ready. Scan item to add directly.')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')
       toast.error(error?.message || 'Unable to open camera')
@@ -309,59 +345,91 @@ export default function InventoryPage() {
     }
   }
 
-  const handleSave = async () => {
-    const name = form.name.trim()
-    const barcode = normalizeBarcode(form.barcode)
-    const price = Number(form.price)
-    const quantity = Number(form.quantity)
-    const unit = form.unit.trim() || 'pcs'
+  const updateCartQty = (id: string, nextQty: number) => {
+    if (nextQty <= 0) {
+      setCart((prev) => prev.filter((entry) => entry.id !== id))
+      return
+    }
+    setCart((prev) => prev.map((entry) => (entry.id === id ? { ...entry, quantity: nextQty } : entry)))
+  }
 
-    if (!name || !barcode || Number.isNaN(price) || Number.isNaN(quantity)) {
-      toast.error('Name, barcode, price and quantity are required')
+  const printBill = () => {
+    if (cart.length === 0) {
+      toast.error('Cart is empty')
       return
     }
 
-    if (editingId) {
-      try {
-        await updateInventoryItem(editingId, { name, barcode, price, quantity, unit })
-        const next = items.map((item) =>
-          item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
-        )
-        cacheItems(next)
-        toast.success('Item updated')
-      } catch (error: any) {
-        toast.error(error?.message || 'Failed to update item')
+    const rows = cart
+      .map((entry) => {
+        const lineTotal = Number(entry.price) * Number(entry.quantity)
+        return `
+          <tr>
+            <td style="border:1px solid #ddd;padding:6px;">${entry.name}</td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${entry.quantity}</td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${Number(entry.price).toFixed(2)}</td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${lineTotal.toFixed(2)}</td>
+          </tr>
+        `
+      })
+      .join('')
+
+    const html = `
+      <html>
+      <head><title>Billing Receipt</title></head>
+      <body style="font-family:Arial,sans-serif;padding:16px;">
+        <h2 style="margin:0 0 8px;">Billing Receipt</h2>
+        <div style="margin-bottom:12px;">Date: ${new Date().toLocaleString()}</div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="border:1px solid #ddd;padding:6px;text-align:left;">Item</th>
+              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Qty</th>
+              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Price</th>
+              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <h3 style="text-align:right;margin-top:12px;">Grand Total: Rs ${cartTotal.toFixed(2)}</h3>
+      </body>
+      </html>
+    `
+
+    const popup = window.open('', '_blank', 'width=900,height=700')
+    if (popup) {
+      popup.document.write(html)
+      popup.document.close()
+      popup.onload = () => {
+        popup.focus()
+        popup.print()
       }
-    } else {
-      try {
-        const created = await createInventoryItem({ name, barcode, price, quantity, unit })
-        cacheItems([created, ...items])
-        toast.success('Item added')
-      } catch (error: any) {
-        toast.error(error?.message || 'Failed to add item')
-      }
+      return
     }
 
-    setForm(emptyForm)
-    setEditingId(null)
-    setScanStatus('')
-  }
-
-  const handleDelete = async (itemId: string) => {
-    const item = items.find((entry) => entry.id === itemId)
-    if (!item) return
-    if (!window.confirm(`Delete "${item.name}"?`)) return
-    try {
-      await deleteInventoryItem(itemId)
-      cacheItems(items.filter((entry) => entry.id !== itemId))
-      if (editingId === itemId) {
-        setEditingId(null)
-        setForm(emptyForm)
-      }
-      toast.success('Item deleted')
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to delete item')
+    const iframe = document.createElement('iframe')
+    iframe.style.position = 'fixed'
+    iframe.style.right = '0'
+    iframe.style.bottom = '0'
+    iframe.style.width = '0'
+    iframe.style.height = '0'
+    iframe.style.border = '0'
+    document.body.appendChild(iframe)
+    const frameDoc = iframe.contentDocument || iframe.contentWindow?.document
+    if (!frameDoc) {
+      document.body.removeChild(iframe)
+      toast.error('Could not initialize print view')
+      return
     }
+    frameDoc.open()
+    frameDoc.write(html)
+    frameDoc.close()
+    setTimeout(() => {
+      iframe.contentWindow?.focus()
+      iframe.contentWindow?.print()
+      setTimeout(() => {
+        if (document.body.contains(iframe)) document.body.removeChild(iframe)
+      }, 600)
+    }, 300)
   }
 
   if (authLoading) {
@@ -370,137 +438,101 @@ export default function InventoryPage() {
 
   return (
     <div className="min-h-screen bg-gray-100">
-      <AppHeader active="inventory" userEmail={currentUser?.email || undefined} />
+      <AppHeader active="billing" userEmail={currentUser?.email || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
         <section className="bg-white rounded-lg shadow p-4">
-          <h1 className="text-xl font-semibold">Inventory Management</h1>
+          <h1 className="text-xl font-semibold">Billing Counter</h1>
           <p className="text-sm text-gray-600 mt-1">
-            Add or update stock here. Scanning here only fills barcode/item details.
+            Billing view only shows items that you add to the bill. Inventory list is hidden here.
           </p>
         </section>
 
         <section className="bg-white rounded-lg shadow p-4 space-y-3">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-            <input
-              className="input"
-              placeholder="Item name"
-              value={form.name}
-              onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-            <input
-              className="input"
-              placeholder="Barcode"
-              value={form.barcode}
-              onChange={(e) => setForm((prev) => ({ ...prev, barcode: e.target.value }))}
-            />
-            <input
-              className="input"
-              type="number"
-              placeholder="Price"
-              value={form.price}
-              onChange={(e) => setForm((prev) => ({ ...prev, price: e.target.value }))}
-            />
-            <input
-              className="input"
-              type="number"
-              placeholder="Quantity"
-              value={form.quantity}
-              onChange={(e) => setForm((prev) => ({ ...prev, quantity: e.target.value }))}
-            />
-            <input
-              className="input"
-              placeholder="Unit (pcs, kg, etc.)"
-              value={form.unit}
-              onChange={(e) => setForm((prev) => ({ ...prev, unit: e.target.value }))}
-            />
-          </div>
-
           <div className="flex flex-wrap gap-2">
-            <button className="btn btn-primary" onClick={handleSave}>
-              {editingId ? 'Update Item' : 'Add Item'}
+            <input
+              className="input flex-1 min-w-[220px]"
+              placeholder="Enter barcode or item name"
+              value={manualEntry}
+              onChange={(e) => setManualEntry(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  addToBillByQuery(manualEntry)
+                  setManualEntry('')
+                }
+              }}
+            />
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                addToBillByQuery(manualEntry)
+                setManualEntry('')
+              }}
+              disabled={loading}
+            >
+              Add To Bill
             </button>
             <button className="btn btn-secondary" onClick={startScanner}>
-              Scan Barcode
+              Scan To Bill
             </button>
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                setEditingId(null)
-                setForm(emptyForm)
-                setScanStatus('')
-              }}
-            >
-              Clear Form
+            <button className="btn btn-outline" onClick={loadItems}>
+              Refresh Inventory Source
             </button>
           </div>
-          {scanStatus ? <div className="text-sm text-blue-700">{scanStatus}</div> : null}
+          <div className="text-xs text-gray-600">
+            {loading ? 'Loading inventory source...' : `${items.length} inventory items available for lookup`}
+          </div>
         </section>
 
-        <section className="bg-white rounded-lg shadow p-4 space-y-3">
-          <div className="flex flex-wrap gap-2 items-center justify-between">
-            <h2 className="text-lg font-semibold">Inventory Items</h2>
-            <input
-              className="input w-full sm:w-72"
-              placeholder="Search name or barcode"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
+        <section className="bg-white rounded-lg shadow p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold">Current Bill</h2>
+            <div className="text-lg font-semibold">Rs {cartTotal.toFixed(2)}</div>
           </div>
 
-          {loading ? (
-            <div className="text-sm text-gray-600">Loading items...</div>
-          ) : filteredItems.length === 0 ? (
-            <div className="text-sm text-gray-600">No items found.</div>
+          {cart.length === 0 ? (
+            <div className="text-sm text-gray-600">No items in bill yet.</div>
           ) : (
-            <div className="overflow-auto">
-              <table className="min-w-full text-sm">
-                <thead>
-                  <tr className="text-left border-b">
-                    <th className="py-2 pr-4">Name</th>
-                    <th className="py-2 pr-4">Barcode</th>
-                    <th className="py-2 pr-4">Price</th>
-                    <th className="py-2 pr-4">Qty</th>
-                    <th className="py-2 pr-4">Unit</th>
-                    <th className="py-2 pr-4">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredItems.map((item) => (
-                    <tr key={item.id} className="border-b">
-                      <td className="py-2 pr-4">{item.name}</td>
-                      <td className="py-2 pr-4">{item.barcode}</td>
-                      <td className="py-2 pr-4">{Number(item.price || 0).toFixed(2)}</td>
-                      <td className="py-2 pr-4">{item.quantity}</td>
-                      <td className="py-2 pr-4">{item.unit || 'pcs'}</td>
-                      <td className="py-2 pr-4">
-                        <div className="flex gap-2">
-                          <button
-                            className="btn btn-outline btn-sm"
-                            onClick={() => {
-                              setEditingId(item.id)
-                              setForm({
-                                name: item.name,
-                                barcode: item.barcode,
-                                price: String(item.price),
-                                quantity: String(item.quantity),
-                                unit: item.unit || 'pcs',
-                              })
-                            }}
-                          >
-                            Edit
-                          </button>
-                          <button className="btn btn-destructive btn-sm" onClick={() => handleDelete(item.id)}>
-                            Delete
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="space-y-2">
+              {cart.map((entry) => (
+                <div key={entry.id} className="border rounded p-2 flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-medium">{entry.name}</div>
+                    <div className="text-xs text-gray-600">{entry.barcode}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button className="btn btn-secondary btn-sm" onClick={() => updateCartQty(entry.id, entry.quantity - 1)}>
+                      -
+                    </button>
+                    <span className="w-8 text-center text-sm">{entry.quantity}</span>
+                    <button className="btn btn-secondary btn-sm" onClick={() => updateCartQty(entry.id, entry.quantity + 1)}>
+                      +
+                    </button>
+                    <span className="w-24 text-right text-sm">Rs {(entry.price * entry.quantity).toFixed(2)}</span>
+                    <button className="btn btn-destructive btn-sm" onClick={() => updateCartQty(entry.id, 0)}>
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              className="btn btn-secondary"
+              onClick={() => {
+                setCart([])
+                if (typeof window !== 'undefined') localStorage.removeItem(CART_CACHE_KEY)
+              }}
+              disabled={cart.length === 0}
+            >
+              Clear Bill
+            </button>
+            <button className="btn btn-primary" onClick={printBill} disabled={cart.length === 0}>
+              Print Bill
+            </button>
+          </div>
         </section>
       </main>
 
@@ -508,7 +540,7 @@ export default function InventoryPage() {
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-3">
           <div className="bg-white rounded-lg w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">Scan Barcode (Inventory)</h3>
+              <h3 className="text-lg font-semibold">Scan Barcode (Billing)</h3>
               <button className="btn btn-ghost btn-sm" onClick={closeScanner}>
                 Close
               </button>
@@ -528,7 +560,7 @@ export default function InventoryPage() {
             )}
             <video ref={videoRef} className="w-full rounded bg-black max-h-[60vh]" autoPlay playsInline muted />
             <canvas ref={canvasRef} className="hidden" />
-            <div className="text-sm text-gray-700">{scanStatus || 'Point camera to barcode'}</div>
+            <div className="text-sm text-gray-700">{scanStatus || 'Scan item to add directly to bill'}</div>
             <div className="flex gap-2">
               <input
                 className="input flex-1"
@@ -549,7 +581,7 @@ export default function InventoryPage() {
                   setManualScanCode('')
                 }}
               >
-                Use
+                Add
               </button>
             </div>
           </div>
