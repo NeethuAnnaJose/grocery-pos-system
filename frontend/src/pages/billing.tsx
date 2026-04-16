@@ -10,7 +10,7 @@ import {
 } from '@zxing/library'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
-import { InventoryItem, listInventoryItems } from '@/services/inventoryFirebase'
+import { InventoryItem, listInventoryItems, updateInventoryItem } from '@/services/inventoryFirebase'
 
 type CartEntry = {
   id: string
@@ -84,12 +84,18 @@ export default function BillingPage() {
   const [showScanner, setShowScanner] = useState(false)
   const [scanStatus, setScanStatus] = useState('')
   const [manualScanCode, setManualScanCode] = useState('')
+  const [isScannerStarting, setIsScannerStarting] = useState(false)
+  const [isRefreshingInventory, setIsRefreshingInventory] = useState(false)
+  const [isPrinting, setIsPrinting] = useState(false)
+  const [torchSupported, setTorchSupported] = useState(false)
+  const [torchEnabled, setTorchEnabled] = useState(false)
   const [rearVideoInputs, setRearVideoInputs] = useState<Array<{ id: string; label: string }>>([])
   const [selectedRearDeviceId, setSelectedRearDeviceId] = useState('')
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const cartRef = useRef<CartEntry[]>([])
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
@@ -100,14 +106,19 @@ export default function BillingPage() {
     [cart]
   )
 
+  const persistInventoryItems = (nextItems: InventoryItem[]) => {
+    setItems(nextItems)
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(nextItems))
+    }
+  }
+
   const loadItems = async () => {
     try {
       setLoading(true)
+      setIsRefreshingInventory(true)
       const data = await listInventoryItems()
-      setItems(data)
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(data))
-      }
+      persistInventoryItems(data)
     } catch {
       const fallback =
         typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]') : []
@@ -119,6 +130,7 @@ export default function BillingPage() {
       }
     } finally {
       setLoading(false)
+      setIsRefreshingInventory(false)
     }
   }
 
@@ -137,6 +149,7 @@ export default function BillingPage() {
   useEffect(() => {
     if (typeof window === 'undefined') return
     localStorage.setItem(CART_CACHE_KEY, JSON.stringify(cart))
+    cartRef.current = cart
   }, [cart])
 
   const stopScanner = () => {
@@ -151,6 +164,8 @@ export default function BillingPage() {
     if (videoRef.current) {
       videoRef.current.srcObject = null
     }
+    setTorchSupported(false)
+    setTorchEnabled(false)
   }
 
   useEffect(() => () => stopScanner(), [])
@@ -191,10 +206,45 @@ export default function BillingPage() {
     }
   }
 
-  const addToCart = (item: InventoryItem) => {
+  const changeInventoryQty = async (itemId: string, delta: number) => {
+    const source = items.find((entry) => entry.id === itemId)
+    if (!source) return false
+    const currentQty = Number(source.quantity || 0)
+    const nextQty = currentQty + delta
+    if (nextQty < 0) return false
+
+    const nextItems = items.map((entry) => (entry.id === itemId ? { ...entry, quantity: nextQty } : entry))
+    persistInventoryItems(nextItems)
+
+    try {
+      await updateInventoryItem(source.id, {
+        name: source.name,
+        barcode: source.barcode,
+        price: Number(source.price || 0),
+        quantity: nextQty,
+        unit: source.unit || 'pcs',
+      })
+    } catch {
+      // Keep local state aligned to user action for smooth billing flow.
+    }
+
+    return true
+  }
+
+  const addToCart = async (item: InventoryItem, incrementIfExists = true) => {
+    const existing = cartRef.current.find((entry) => entry.id === item.id)
+    const shouldIncrease = existing ? incrementIfExists : true
+    if (!shouldIncrease) return true
+
+    const ok = await changeInventoryQty(item.id, -1)
+    if (!ok) {
+      toast.error(`Out of stock: ${item.name}`)
+      return false
+    }
+
     setCart((prev) => {
-      const existing = prev.find((entry) => entry.id === item.id)
-      if (existing) {
+      const current = prev.find((entry) => entry.id === item.id)
+      if (current) {
         return prev.map((entry) =>
           entry.id === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry
         )
@@ -211,32 +261,34 @@ export default function BillingPage() {
         },
       ]
     })
+
+    return true
   }
 
-  const addToBillByQuery = (query: string) => {
+  const addToBillByQuery = async (query: string) => {
     const value = query.trim()
     if (!value) return
 
     const normalized = normalizeBarcode(value)
     const barcodeMatches = items.filter((item) => itemMatchesBarcode(item, normalized))
     if (barcodeMatches.length > 0) {
-      addToCart(barcodeMatches[0])
-      toast.success(`Added: ${barcodeMatches[0].name}`)
+      const success = await addToCart(barcodeMatches[0], true)
+      if (success) toast.success(`Added: ${barcodeMatches[0].name}`)
       return
     }
 
     const lowered = value.toLowerCase()
     const exactName = items.find((item) => item.name.trim().toLowerCase() === lowered)
     if (exactName) {
-      addToCart(exactName)
-      toast.success(`Added: ${exactName.name}`)
+      const success = await addToCart(exactName, true)
+      if (success) toast.success(`Added: ${exactName.name}`)
       return
     }
 
     const contains = items.filter((item) => item.name.toLowerCase().includes(lowered))
     if (contains.length === 1) {
-      addToCart(contains[0])
-      toast.success(`Added: ${contains[0].name}`)
+      const success = await addToCart(contains[0], true)
+      if (success) toast.success(`Added: ${contains[0].name}`)
       return
     }
     if (contains.length > 1) {
@@ -247,7 +299,7 @@ export default function BillingPage() {
     toast.error('Item not found in inventory. Add it in Inventory section first.')
   }
 
-  const processScannedCode = (rawCode: string) => {
+  const processScannedCode = async (rawCode: string) => {
     const code = normalizeBarcode(rawCode)
     if (!code) return
 
@@ -272,7 +324,13 @@ export default function BillingPage() {
       return
     }
 
-    addToCart(match)
+    const existsAlready = cartRef.current.some((entry) => entry.id === match.id)
+    await addToCart(match, false)
+    if (existsAlready) {
+      setScanStatus(`Already in bill: ${match.name}`)
+      toast('Already added. Use + / - to change quantity.')
+      return
+    }
     setScanStatus(`Added to bill: ${match.name}`)
     toast.success(`Added: ${match.name}`)
   }
@@ -290,48 +348,96 @@ export default function BillingPage() {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })
     if (!ctx) return
 
-    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.07)'
-    ctx.drawImage(video, 0, 0, width, height)
+    const detectFromCurrentCanvas = async () => {
+      if ('BarcodeDetector' in window) {
+        try {
+          const detector = new (window as any).BarcodeDetector({
+            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
+          })
+          const results = await detector.detect(canvas)
+          if (results?.[0]?.rawValue) {
+            processScannedCode(String(results[0].rawValue))
+            return true
+          }
+        } catch {
+          // Fallback to ZXing below.
+        }
+      }
 
-    if ('BarcodeDetector' in window) {
       try {
-        const detector = new (window as any).BarcodeDetector({
-          formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
-        })
-        const results = await detector.detect(canvas)
-        if (results?.[0]?.rawValue) {
-          processScannedCode(String(results[0].rawValue))
-          return
+        const image = ctx.getImageData(0, 0, width, height)
+        if (!zxingReaderRef.current) {
+          const hints = new Map()
+          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.ITF,
+          ])
+          zxingReaderRef.current = new MultiFormatReader()
+          zxingReaderRef.current.setHints(hints)
+        }
+        const luminance = new RGBLuminanceSource(image.data, width, height)
+        const binary = new BinaryBitmap(new HybridBinarizer(luminance))
+        const result = zxingReaderRef.current.decode(binary)
+        if (result?.getText()) {
+          processScannedCode(result.getText())
+          return true
         }
       } catch {
-        // Fallback to ZXing below.
+        // Try dim-light pass below.
       }
+      return false
     }
 
-    const image = ctx.getImageData(0, 0, width, height)
-    if (!zxingReaderRef.current) {
-      const hints = new Map()
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-        BarcodeFormat.EAN_13,
-        BarcodeFormat.EAN_8,
-        BarcodeFormat.UPC_A,
-        BarcodeFormat.UPC_E,
-        BarcodeFormat.CODE_128,
-        BarcodeFormat.CODE_39,
-        BarcodeFormat.ITF,
-      ])
-      zxingReaderRef.current = new MultiFormatReader()
-      zxingReaderRef.current.setHints(hints)
+    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
+    ctx.drawImage(video, 0, 0, width, height)
+    const firstPass = await detectFromCurrentCanvas()
+    if (firstPass) return
+
+    ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
+    ctx.drawImage(video, 0, 0, width, height)
+    await detectFromCurrentCanvas()
+  }
+
+  const applyCameraEnhancements = async (stream: MediaStream) => {
+    const track = stream.getVideoTracks()[0]
+    if (!track || !track.applyConstraints) return
+    const capabilities = (track.getCapabilities?.() || {}) as any
+    const advanced: any[] = []
+
+    if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' })
     }
+    if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes('continuous')) {
+      advanced.push({ exposureMode: 'continuous' })
+    }
+    if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes('continuous')) {
+      advanced.push({ whiteBalanceMode: 'continuous' })
+    }
+    if (typeof capabilities.zoom?.max === 'number' && capabilities.zoom.max > 1) {
+      const zoomValue = Math.min(capabilities.zoom.max, Math.max(capabilities.zoom.min || 1, 1.2))
+      advanced.push({ zoom: zoomValue })
+    }
+    if (advanced.length) {
+      await track.applyConstraints({ advanced }).catch(() => {})
+    }
+
+    setTorchSupported(!!capabilities.torch)
+  }
+
+  const toggleTorch = async () => {
+    const track = streamRef.current?.getVideoTracks?.()[0]
+    if (!track?.applyConstraints) return
+    const next = !torchEnabled
     try {
-      const luminance = new RGBLuminanceSource(image.data, width, height)
-      const binary = new BinaryBitmap(new HybridBinarizer(luminance))
-      const result = zxingReaderRef.current.decode(binary)
-      if (result?.getText()) {
-        processScannedCode(result.getText())
-      }
+      await track.applyConstraints({ advanced: [{ torch: next }] as any }).catch(() => {})
+      setTorchEnabled(next)
     } catch {
-      // No readable barcode in this frame.
+      toast.error('Torch is not supported on this device')
     }
   }
 
@@ -342,6 +448,7 @@ export default function BillingPage() {
     }
 
     setScanStatus('Opening camera...')
+    setIsScannerStarting(true)
     setShowScanner(true)
     await refreshRearVideoInputs()
 
@@ -353,15 +460,18 @@ export default function BillingPage() {
               deviceId: { exact: selectedRearDeviceId },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 60 },
             }
           : {
               facingMode: { ideal: 'environment' },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 60 },
             },
       }
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
+      await applyCameraEnhancements(stream)
       if (videoRef.current) {
         videoRef.current.srcObject = stream
         await videoRef.current.play().catch(() => {})
@@ -370,21 +480,48 @@ export default function BillingPage() {
       if (intervalRef.current) clearInterval(intervalRef.current)
       intervalRef.current = setInterval(() => {
         decodeWithCanvas().catch(() => {})
-      }, 220)
+      }, 140)
       setScanStatus('Scanner ready. Scan item to add directly.')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')
       toast.error(error?.message || 'Unable to open camera')
       closeScanner()
+    } finally {
+      setIsScannerStarting(false)
     }
   }
 
-  const updateCartQty = (id: string, nextQty: number) => {
-    if (nextQty <= 0) {
+  const updateCartQty = async (id: string, nextQty: number) => {
+    const current = cartRef.current.find((entry) => entry.id === id)
+    if (!current) return
+    const normalizedNext = Math.max(0, Math.floor(nextQty))
+    if (normalizedNext === current.quantity) return
+
+    const delta = normalizedNext - current.quantity
+    if (delta > 0) {
+      const ok = await changeInventoryQty(id, -delta)
+      if (!ok) {
+        toast.error('Not enough stock in inventory')
+        return
+      }
+    } else if (delta < 0) {
+      await changeInventoryQty(id, Math.abs(delta))
+    }
+
+    if (normalizedNext <= 0) {
       setCart((prev) => prev.filter((entry) => entry.id !== id))
       return
     }
-    setCart((prev) => prev.map((entry) => (entry.id === id ? { ...entry, quantity: nextQty } : entry)))
+    setCart((prev) => prev.map((entry) => (entry.id === id ? { ...entry, quantity: normalizedNext } : entry)))
+  }
+
+  const clearBill = async () => {
+    if (!cart.length) return
+    for (const entry of cart) {
+      await changeInventoryQty(entry.id, entry.quantity)
+    }
+    setCart([])
+    if (typeof window !== 'undefined') localStorage.removeItem(CART_CACHE_KEY)
   }
 
   const printBill = () => {
@@ -392,6 +529,7 @@ export default function BillingPage() {
       toast.error('Cart is empty')
       return
     }
+    setIsPrinting(true)
 
     const rows = cart
       .map((entry) => {
@@ -436,6 +574,7 @@ export default function BillingPage() {
       popup.onload = () => {
         popup.focus()
         popup.print()
+        setIsPrinting(false)
       }
       return
     }
@@ -452,6 +591,7 @@ export default function BillingPage() {
     if (!frameDoc) {
       document.body.removeChild(iframe)
       toast.error('Could not initialize print view')
+      setIsPrinting(false)
       return
     }
     frameDoc.open()
@@ -460,10 +600,11 @@ export default function BillingPage() {
     setTimeout(() => {
       iframe.contentWindow?.focus()
       iframe.contentWindow?.print()
+      setIsPrinting(false)
       setTimeout(() => {
         if (document.body.contains(iframe)) document.body.removeChild(iframe)
       }, 600)
-    }, 300)
+    }, 100)
   }
 
   if (authLoading) {
@@ -471,18 +612,18 @@ export default function BillingPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen bg-gradient-to-b from-slate-100 to-slate-200">
       <AppHeader active="billing" userEmail={currentUserEmail || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
-        <section className="bg-white rounded-lg shadow p-4">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
           <h1 className="text-xl font-semibold">Billing Counter</h1>
           <p className="text-sm text-gray-600 mt-1">
             Billing view only shows items that you add to the bill. Inventory list is hidden here.
           </p>
         </section>
 
-        <section className="bg-white rounded-lg shadow p-4 space-y-3">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
           <div className="flex flex-wrap gap-2">
             <input
               className="input flex-1 min-w-[220px]"
@@ -491,7 +632,7 @@ export default function BillingPage() {
               onChange={(e) => setManualEntry(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
-                  addToBillByQuery(manualEntry)
+                  void addToBillByQuery(manualEntry)
                   setManualEntry('')
                 }
               }}
@@ -499,18 +640,18 @@ export default function BillingPage() {
             <button
               className="btn btn-primary"
               onClick={() => {
-                addToBillByQuery(manualEntry)
+                void addToBillByQuery(manualEntry)
                 setManualEntry('')
               }}
               disabled={loading}
             >
               Add To Bill
             </button>
-            <button className="btn btn-secondary" onClick={startScanner}>
-              Scan To Bill
+            <button className="btn btn-secondary min-w-32" onClick={startScanner} disabled={isScannerStarting}>
+              {isScannerStarting ? 'Opening...' : 'Scan To Bill'}
             </button>
-            <button className="btn btn-outline" onClick={loadItems}>
-              Refresh Inventory Source
+            <button className="btn btn-outline min-w-40" onClick={loadItems} disabled={isRefreshingInventory}>
+              {isRefreshingInventory ? 'Refreshing...' : 'Refresh Inventory Source'}
             </button>
           </div>
           <div className="text-xs text-gray-600">
@@ -518,7 +659,7 @@ export default function BillingPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-lg shadow p-4">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-lg font-semibold">Current Bill</h2>
             <div className="text-lg font-semibold">Rs {cartTotal.toFixed(2)}</div>
@@ -556,15 +697,14 @@ export default function BillingPage() {
             <button
               className="btn btn-secondary"
               onClick={() => {
-                setCart([])
-                if (typeof window !== 'undefined') localStorage.removeItem(CART_CACHE_KEY)
+                void clearBill()
               }}
               disabled={cart.length === 0}
             >
               Clear Bill
             </button>
-            <button className="btn btn-primary" onClick={printBill} disabled={cart.length === 0}>
-              Print Bill
+            <button className="btn btn-primary min-w-32" onClick={printBill} disabled={cart.length === 0 || isPrinting}>
+              {isPrinting ? 'Printing...' : 'Print Bill'}
             </button>
           </div>
         </section>
@@ -572,7 +712,7 @@ export default function BillingPage() {
 
       {showScanner && (
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-3">
-          <div className="bg-white rounded-lg w-full max-w-xl p-4 space-y-3">
+          <div className="bg-white rounded-xl w-full max-w-xl p-4 space-y-3 border border-slate-200">
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-semibold">Scan Barcode (Billing)</h3>
               <button className="btn btn-ghost btn-sm" onClick={closeScanner}>
@@ -594,6 +734,11 @@ export default function BillingPage() {
             )}
             <video ref={videoRef} className="w-full rounded bg-black max-h-[60vh]" autoPlay playsInline muted />
             <canvas ref={canvasRef} className="hidden" />
+            {torchSupported ? (
+              <button className="btn btn-outline btn-sm" onClick={toggleTorch}>
+                {torchEnabled ? 'Torch Off' : 'Torch On'}
+              </button>
+            ) : null}
             <div className="text-sm text-gray-700">{scanStatus || 'Scan item to add directly to bill'}</div>
             <div className="flex gap-2">
               <input
@@ -603,7 +748,7 @@ export default function BillingPage() {
                 onChange={(e) => setManualScanCode(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    processScannedCode(manualScanCode)
+                    void processScannedCode(manualScanCode)
                     setManualScanCode('')
                   }
                 }}
@@ -611,7 +756,7 @@ export default function BillingPage() {
               <button
                 className="btn btn-primary"
                 onClick={() => {
-                  processScannedCode(manualScanCode)
+                  void processScannedCode(manualScanCode)
                   setManualScanCode('')
                 }}
               >

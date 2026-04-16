@@ -72,6 +72,10 @@ export default function InventoryPage() {
   const [showScanner, setShowScanner] = useState(false)
   const [scanStatus, setScanStatus] = useState('')
   const [manualScanCode, setManualScanCode] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+  const [isScannerStarting, setIsScannerStarting] = useState(false)
+  const [torchSupported, setTorchSupported] = useState(false)
+  const [torchEnabled, setTorchEnabled] = useState(false)
   const [rearVideoInputs, setRearVideoInputs] = useState<Array<{ id: string; label: string }>>([])
   const [selectedRearDeviceId, setSelectedRearDeviceId] = useState('')
 
@@ -133,6 +137,8 @@ export default function InventoryPage() {
     if (videoRef.current) {
       videoRef.current.srcObject = null
     }
+    setTorchSupported(false)
+    setTorchEnabled(false)
   }
 
   useEffect(() => () => stopScanner(), [])
@@ -219,48 +225,100 @@ export default function InventoryPage() {
     const ctx = canvas.getContext('2d', { willReadFrequently: true })
     if (!ctx) return
 
-    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.07)'
-    ctx.drawImage(video, 0, 0, width, height)
+    const detectFromCurrentCanvas = async () => {
+      if ('BarcodeDetector' in window) {
+        try {
+          const detector = new (window as any).BarcodeDetector({
+            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
+          })
+          const results = await detector.detect(canvas)
+          if (results?.[0]?.rawValue) {
+            processScannedCode(String(results[0].rawValue))
+            return true
+          }
+        } catch {
+          // Fallback to ZXing below.
+        }
+      }
 
-    if ('BarcodeDetector' in window) {
       try {
-        const detector = new (window as any).BarcodeDetector({
-          formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
-        })
-        const results = await detector.detect(canvas)
-        if (results?.[0]?.rawValue) {
-          processScannedCode(String(results[0].rawValue))
-          return
+        const image = ctx.getImageData(0, 0, width, height)
+        if (!zxingReaderRef.current) {
+          const hints = new Map()
+          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.ITF,
+          ])
+          zxingReaderRef.current = new MultiFormatReader()
+          zxingReaderRef.current.setHints(hints)
+        }
+        const luminance = new RGBLuminanceSource(image.data, width, height)
+        const binary = new BinaryBitmap(new HybridBinarizer(luminance))
+        const result = zxingReaderRef.current.decode(binary)
+        if (result?.getText()) {
+          processScannedCode(result.getText())
+          return true
         }
       } catch {
-        // Fallback to ZXing below.
+        // Try second pass below.
       }
+      return false
     }
 
-    const image = ctx.getImageData(0, 0, width, height)
-    if (!zxingReaderRef.current) {
-      const hints = new Map()
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-        BarcodeFormat.EAN_13,
-        BarcodeFormat.EAN_8,
-        BarcodeFormat.UPC_A,
-        BarcodeFormat.UPC_E,
-        BarcodeFormat.CODE_128,
-        BarcodeFormat.CODE_39,
-        BarcodeFormat.ITF,
-      ])
-      zxingReaderRef.current = new MultiFormatReader()
-      zxingReaderRef.current.setHints(hints)
+    // Pass 1: normal lighting
+    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
+    ctx.drawImage(video, 0, 0, width, height)
+    const firstPass = await detectFromCurrentCanvas()
+    if (firstPass) return
+
+    // Pass 2: aggressive enhancement for dim light / iPhone low-light autofocus struggles
+    ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
+    ctx.drawImage(video, 0, 0, width, height)
+    await detectFromCurrentCanvas()
+  }
+
+  const applyCameraEnhancements = async (stream: MediaStream) => {
+    const track = stream.getVideoTracks()[0]
+    if (!track || !track.applyConstraints) return
+    const capabilities = (track.getCapabilities?.() || {}) as any
+    const advanced: any[] = []
+
+    if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' })
     }
+    if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes('continuous')) {
+      advanced.push({ exposureMode: 'continuous' })
+    }
+    if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes('continuous')) {
+      advanced.push({ whiteBalanceMode: 'continuous' })
+    }
+    if (typeof capabilities.zoom?.max === 'number' && capabilities.zoom.max > 1) {
+      const zoomValue = Math.min(capabilities.zoom.max, Math.max(capabilities.zoom.min || 1, 1.2))
+      advanced.push({ zoom: zoomValue })
+    }
+
+    if (advanced.length) {
+      await track.applyConstraints({ advanced }).catch(() => {})
+    }
+
+    const supportsTorch = !!capabilities.torch
+    setTorchSupported(supportsTorch)
+  }
+
+  const toggleTorch = async () => {
+    const track = streamRef.current?.getVideoTracks?.()[0]
+    if (!track?.applyConstraints) return
+    const next = !torchEnabled
     try {
-      const luminance = new RGBLuminanceSource(image.data, width, height)
-      const binary = new BinaryBitmap(new HybridBinarizer(luminance))
-      const result = zxingReaderRef.current.decode(binary)
-      if (result?.getText()) {
-        processScannedCode(result.getText())
-      }
+      await track.applyConstraints({ advanced: [{ torch: next }] as any }).catch(() => {})
+      setTorchEnabled(next)
     } catch {
-      // No readable barcode in this frame.
+      toast.error('Torch is not supported on this device')
     }
   }
 
@@ -271,6 +329,7 @@ export default function InventoryPage() {
     }
 
     setScanStatus('Opening camera...')
+    setIsScannerStarting(true)
     setShowScanner(true)
     await refreshRearVideoInputs()
 
@@ -282,16 +341,19 @@ export default function InventoryPage() {
               deviceId: { exact: selectedRearDeviceId },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 60 },
             }
           : {
               facingMode: { ideal: 'environment' },
               width: { ideal: 1920 },
               height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 60 },
             },
       }
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       streamRef.current = stream
+      await applyCameraEnhancements(stream)
       if (videoRef.current) {
         videoRef.current.srcObject = stream
         await videoRef.current.play().catch(() => {})
@@ -300,16 +362,19 @@ export default function InventoryPage() {
       if (intervalRef.current) clearInterval(intervalRef.current)
       intervalRef.current = setInterval(() => {
         decodeWithCanvas().catch(() => {})
-      }, 220)
+      }, 140)
       setScanStatus('Scanner is active')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')
       toast.error(error?.message || 'Unable to open camera')
       closeScanner()
+    } finally {
+      setIsScannerStarting(false)
     }
   }
 
   const handleSave = async () => {
+    if (isSaving) return
     const name = form.name.trim()
     const barcode = normalizeBarcode(form.barcode)
     const price = Number(form.price)
@@ -321,6 +386,23 @@ export default function InventoryPage() {
       return
     }
 
+    if (!editingId) {
+      const existingByBarcode = items.find((item) => itemMatchesBarcode(item, barcode))
+      if (existingByBarcode) {
+        toast.error('This barcode already exists. Use Edit instead of adding duplicate.')
+        setEditingId(existingByBarcode.id)
+        setForm({
+          name: existingByBarcode.name,
+          barcode: existingByBarcode.barcode,
+          price: String(existingByBarcode.price),
+          quantity: String(existingByBarcode.quantity),
+          unit: existingByBarcode.unit || 'pcs',
+        })
+        return
+      }
+    }
+
+    setIsSaving(true)
     if (editingId) {
       try {
         await updateInventoryItem(editingId, { name, barcode, price, quantity, unit })
@@ -362,6 +444,7 @@ export default function InventoryPage() {
     setForm(emptyForm)
     setEditingId(null)
     setScanStatus('')
+    setIsSaving(false)
   }
 
   const handleDelete = async (itemId: string) => {
@@ -391,18 +474,18 @@ export default function InventoryPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen bg-gradient-to-b from-slate-100 to-slate-200">
       <AppHeader active="inventory" userEmail={currentUserEmail || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
-        <section className="bg-white rounded-lg shadow p-4">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
           <h1 className="text-xl font-semibold">Inventory Management</h1>
           <p className="text-sm text-gray-600 mt-1">
             Add or update stock here. Scanning here only fills barcode/item details.
           </p>
         </section>
 
-        <section className="bg-white rounded-lg shadow p-4 space-y-3">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <input
               className="input"
@@ -439,11 +522,11 @@ export default function InventoryPage() {
           </div>
 
           <div className="flex flex-wrap gap-2">
-            <button className="btn btn-primary" onClick={handleSave}>
-              {editingId ? 'Update Item' : 'Add Item'}
+            <button className="btn btn-primary min-w-32" onClick={handleSave} disabled={isSaving}>
+              {isSaving ? 'Saving...' : editingId ? 'Update Item' : 'Add Item'}
             </button>
-            <button className="btn btn-secondary" onClick={startScanner}>
-              Scan Barcode
+            <button className="btn btn-secondary min-w-32" onClick={startScanner} disabled={isScannerStarting}>
+              {isScannerStarting ? 'Opening...' : 'Scan Barcode'}
             </button>
             <button
               className="btn btn-ghost"
@@ -459,7 +542,7 @@ export default function InventoryPage() {
           {scanStatus ? <div className="text-sm text-blue-700">{scanStatus}</div> : null}
         </section>
 
-        <section className="bg-white rounded-lg shadow p-4 space-y-3">
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
           <div className="flex flex-wrap gap-2 items-center justify-between">
             <h2 className="text-lg font-semibold">Inventory Items</h2>
             <input
@@ -528,7 +611,7 @@ export default function InventoryPage() {
 
       {showScanner && (
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-3">
-          <div className="bg-white rounded-lg w-full max-w-xl p-4 space-y-3">
+          <div className="bg-white rounded-xl w-full max-w-xl p-4 space-y-3 border border-slate-200">
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-semibold">Scan Barcode (Inventory)</h3>
               <button className="btn btn-ghost btn-sm" onClick={closeScanner}>
@@ -550,6 +633,11 @@ export default function InventoryPage() {
             )}
             <video ref={videoRef} className="w-full rounded bg-black max-h-[60vh]" autoPlay playsInline muted />
             <canvas ref={canvasRef} className="hidden" />
+            {torchSupported ? (
+              <button className="btn btn-outline btn-sm" onClick={toggleTorch}>
+                {torchEnabled ? 'Torch Off' : 'Torch On'}
+              </button>
+            ) : null}
             <div className="text-sm text-gray-700">{scanStatus || 'Point camera to barcode'}</div>
             <div className="flex gap-2">
               <input
