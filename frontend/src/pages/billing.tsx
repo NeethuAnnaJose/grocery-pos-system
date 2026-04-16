@@ -95,7 +95,10 @@ export default function BillingPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const detectorRef = useRef<any | null>(null)
+  const isDecodingRef = useRef(false)
   const cartRef = useRef<CartEntry[]>([])
+  const inventoryRef = useRef<InventoryItem[]>([])
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
@@ -107,6 +110,7 @@ export default function BillingPage() {
   )
 
   const persistInventoryItems = (nextItems: InventoryItem[]) => {
+    inventoryRef.current = nextItems
     setItems(nextItems)
     if (typeof window !== 'undefined') {
       localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(nextItems))
@@ -123,7 +127,7 @@ export default function BillingPage() {
       const fallback =
         typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]') : []
       if (Array.isArray(fallback)) {
-        setItems(fallback)
+        persistInventoryItems(fallback)
         toast.error('Using cached inventory for billing')
       } else {
         toast.error('Failed to load inventory')
@@ -142,6 +146,7 @@ export default function BillingPage() {
     if (typeof window === 'undefined') return
     const cached = JSON.parse(localStorage.getItem(CART_CACHE_KEY) || '[]')
     if (Array.isArray(cached)) {
+      cartRef.current = cached
       setCart(cached)
     }
   }, [])
@@ -151,6 +156,10 @@ export default function BillingPage() {
     localStorage.setItem(CART_CACHE_KEY, JSON.stringify(cart))
     cartRef.current = cart
   }, [cart])
+
+  useEffect(() => {
+    inventoryRef.current = items
+  }, [items])
 
   const stopScanner = () => {
     if (intervalRef.current) {
@@ -166,6 +175,8 @@ export default function BillingPage() {
     }
     setTorchSupported(false)
     setTorchEnabled(false)
+    detectorRef.current = null
+    isDecodingRef.current = false
   }
 
   useEffect(() => () => stopScanner(), [])
@@ -207,13 +218,15 @@ export default function BillingPage() {
   }
 
   const changeInventoryQty = async (itemId: string, delta: number) => {
-    const source = items.find((entry) => entry.id === itemId)
+    const source = inventoryRef.current.find((entry) => entry.id === itemId)
     if (!source) return false
     const currentQty = Number(source.quantity || 0)
     const nextQty = currentQty + delta
     if (nextQty < 0) return false
 
-    const nextItems = items.map((entry) => (entry.id === itemId ? { ...entry, quantity: nextQty } : entry))
+    const nextItems = inventoryRef.current.map((entry) =>
+      entry.id === itemId ? { ...entry, quantity: nextQty } : entry
+    )
     persistInventoryItems(nextItems)
 
     try {
@@ -308,12 +321,12 @@ export default function BillingPage() {
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
-    let sourceItems = items
+    let sourceItems = inventoryRef.current
     if (!sourceItems.length && typeof window !== 'undefined') {
       const cached = JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]')
       if (Array.isArray(cached) && cached.length) {
         sourceItems = cached as InventoryItem[]
-        setItems(cached as InventoryItem[])
+        persistInventoryItems(cached as InventoryItem[])
       }
     }
 
@@ -336,71 +349,79 @@ export default function BillingPage() {
   }
 
   const decodeWithCanvas = async () => {
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    if (!video || !canvas || video.readyState < 2) return
+    if (isDecodingRef.current) return
+    isDecodingRef.current = true
+    try {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas || video.readyState < 2) return
 
-    const width = Math.max(1, video.videoWidth || 1280)
-    const height = Math.max(1, video.videoHeight || 720)
-    canvas.width = width
-    canvas.height = height
+      const width = Math.max(1, video.videoWidth || 1280)
+      const height = Math.max(1, video.videoHeight || 720)
+      canvas.width = width
+      canvas.height = height
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      if (!ctx) return
 
-    const detectFromCurrentCanvas = async () => {
-      if ('BarcodeDetector' in window) {
+      const detectFromCurrentCanvas = async () => {
+        if ('BarcodeDetector' in window) {
+          try {
+            if (!detectorRef.current) {
+              detectorRef.current = new (window as any).BarcodeDetector({
+                formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
+              })
+            }
+            const results = await detectorRef.current.detect(canvas)
+            if (results?.[0]?.rawValue) {
+              processScannedCode(String(results[0].rawValue))
+              return true
+            }
+          } catch {
+            // Fallback to ZXing below.
+          }
+        }
+
         try {
-          const detector = new (window as any).BarcodeDetector({
-            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
-          })
-          const results = await detector.detect(canvas)
-          if (results?.[0]?.rawValue) {
-            processScannedCode(String(results[0].rawValue))
+          const image = ctx.getImageData(0, 0, width, height)
+          if (!zxingReaderRef.current) {
+            const hints = new Map()
+            hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+              BarcodeFormat.EAN_13,
+              BarcodeFormat.EAN_8,
+              BarcodeFormat.UPC_A,
+              BarcodeFormat.UPC_E,
+              BarcodeFormat.CODE_128,
+              BarcodeFormat.CODE_39,
+              BarcodeFormat.ITF,
+            ])
+            zxingReaderRef.current = new MultiFormatReader()
+            zxingReaderRef.current.setHints(hints)
+          }
+          const luminance = new RGBLuminanceSource(image.data, width, height)
+          const binary = new BinaryBitmap(new HybridBinarizer(luminance))
+          const result = zxingReaderRef.current.decode(binary)
+          if (result?.getText()) {
+            processScannedCode(result.getText())
             return true
           }
         } catch {
-          // Fallback to ZXing below.
+          // Try dim-light pass below.
         }
+        return false
       }
 
-      try {
-        const image = ctx.getImageData(0, 0, width, height)
-        if (!zxingReaderRef.current) {
-          const hints = new Map()
-          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-            BarcodeFormat.EAN_13,
-            BarcodeFormat.EAN_8,
-            BarcodeFormat.UPC_A,
-            BarcodeFormat.UPC_E,
-            BarcodeFormat.CODE_128,
-            BarcodeFormat.CODE_39,
-            BarcodeFormat.ITF,
-          ])
-          zxingReaderRef.current = new MultiFormatReader()
-          zxingReaderRef.current.setHints(hints)
-        }
-        const luminance = new RGBLuminanceSource(image.data, width, height)
-        const binary = new BinaryBitmap(new HybridBinarizer(luminance))
-        const result = zxingReaderRef.current.decode(binary)
-        if (result?.getText()) {
-          processScannedCode(result.getText())
-          return true
-        }
-      } catch {
-        // Try dim-light pass below.
-      }
-      return false
+      ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
+      ctx.drawImage(video, 0, 0, width, height)
+      const firstPass = await detectFromCurrentCanvas()
+      if (firstPass) return
+
+      ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
+      ctx.drawImage(video, 0, 0, width, height)
+      await detectFromCurrentCanvas()
+    } finally {
+      isDecodingRef.current = false
     }
-
-    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
-    ctx.drawImage(video, 0, 0, width, height)
-    const firstPass = await detectFromCurrentCanvas()
-    if (firstPass) return
-
-    ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
-    ctx.drawImage(video, 0, 0, width, height)
-    await detectFromCurrentCanvas()
   }
 
   const applyCameraEnhancements = async (stream: MediaStream) => {
@@ -450,26 +471,53 @@ export default function BillingPage() {
     setScanStatus('Opening camera...')
     setIsScannerStarting(true)
     setShowScanner(true)
-    await refreshRearVideoInputs()
+    const rearList = await refreshRearVideoInputs()
 
     try {
-      const constraints: MediaStreamConstraints = {
-        audio: false,
-        video: selectedRearDeviceId
-          ? {
-              deviceId: { exact: selectedRearDeviceId },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
-              frameRate: { ideal: 30, max: 60 },
-            }
-          : {
-              facingMode: { ideal: 'environment' },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
-              frameRate: { ideal: 30, max: 60 },
-            },
+      const preferredRearId = selectedRearDeviceId || rearList[0]?.id || ''
+      const options: MediaStreamConstraints[] = [
+        ...(preferredRearId
+          ? [{
+              audio: false,
+              video: {
+                deviceId: { exact: preferredRearId },
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 30, max: 60 },
+              },
+            }]
+          : []),
+        {
+          audio: false,
+          video: {
+            facingMode: { exact: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30, max: 60 },
+          },
+        },
+        {
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 24, max: 30 },
+          },
+        },
+        { audio: false, video: true },
+      ]
+
+      let stream: MediaStream | null = null
+      for (const constraints of options) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints)
+          break
+        } catch {
+          // Continue through fallbacks
+        }
       }
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      if (!stream) throw new Error('Unable to access camera')
       streamRef.current = stream
       await applyCameraEnhancements(stream)
       if (videoRef.current) {
@@ -480,7 +528,7 @@ export default function BillingPage() {
       if (intervalRef.current) clearInterval(intervalRef.current)
       intervalRef.current = setInterval(() => {
         decodeWithCanvas().catch(() => {})
-      }, 140)
+      }, 90)
       setScanStatus('Scanner ready. Scan item to add directly.')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')
@@ -516,8 +564,9 @@ export default function BillingPage() {
   }
 
   const clearBill = async () => {
-    if (!cart.length) return
-    for (const entry of cart) {
+    const currentCart = cartRef.current
+    if (!currentCart.length) return
+    for (const entry of currentCart) {
       await changeInventoryQty(entry.id, entry.quantity)
     }
     setCart([])

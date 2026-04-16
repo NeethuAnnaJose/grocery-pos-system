@@ -82,6 +82,8 @@ export default function InventoryPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const detectorRef = useRef<any | null>(null)
+  const isDecodingRef = useRef(false)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
@@ -139,6 +141,8 @@ export default function InventoryPage() {
     }
     setTorchSupported(false)
     setTorchEnabled(false)
+    detectorRef.current = null
+    isDecodingRef.current = false
   }
 
   useEffect(() => () => stopScanner(), [])
@@ -213,73 +217,81 @@ export default function InventoryPage() {
   }
 
   const decodeWithCanvas = async () => {
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    if (!video || !canvas || video.readyState < 2) return
+    if (isDecodingRef.current) return
+    isDecodingRef.current = true
+    try {
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas || video.readyState < 2) return
 
-    const width = Math.max(1, video.videoWidth || 1280)
-    const height = Math.max(1, video.videoHeight || 720)
-    canvas.width = width
-    canvas.height = height
+      const width = Math.max(1, video.videoWidth || 1280)
+      const height = Math.max(1, video.videoHeight || 720)
+      canvas.width = width
+      canvas.height = height
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })
-    if (!ctx) return
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      if (!ctx) return
 
-    const detectFromCurrentCanvas = async () => {
-      if ('BarcodeDetector' in window) {
+      const detectFromCurrentCanvas = async () => {
+        if ('BarcodeDetector' in window) {
+          try {
+            if (!detectorRef.current) {
+              detectorRef.current = new (window as any).BarcodeDetector({
+                formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
+              })
+            }
+            const results = await detectorRef.current.detect(canvas)
+            if (results?.[0]?.rawValue) {
+              processScannedCode(String(results[0].rawValue))
+              return true
+            }
+          } catch {
+            // Fallback to ZXing below.
+          }
+        }
+
         try {
-          const detector = new (window as any).BarcodeDetector({
-            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
-          })
-          const results = await detector.detect(canvas)
-          if (results?.[0]?.rawValue) {
-            processScannedCode(String(results[0].rawValue))
+          const image = ctx.getImageData(0, 0, width, height)
+          if (!zxingReaderRef.current) {
+            const hints = new Map()
+            hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+              BarcodeFormat.EAN_13,
+              BarcodeFormat.EAN_8,
+              BarcodeFormat.UPC_A,
+              BarcodeFormat.UPC_E,
+              BarcodeFormat.CODE_128,
+              BarcodeFormat.CODE_39,
+              BarcodeFormat.ITF,
+            ])
+            zxingReaderRef.current = new MultiFormatReader()
+            zxingReaderRef.current.setHints(hints)
+          }
+          const luminance = new RGBLuminanceSource(image.data, width, height)
+          const binary = new BinaryBitmap(new HybridBinarizer(luminance))
+          const result = zxingReaderRef.current.decode(binary)
+          if (result?.getText()) {
+            processScannedCode(result.getText())
             return true
           }
         } catch {
-          // Fallback to ZXing below.
+          // Try second pass below.
         }
+        return false
       }
 
-      try {
-        const image = ctx.getImageData(0, 0, width, height)
-        if (!zxingReaderRef.current) {
-          const hints = new Map()
-          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-            BarcodeFormat.EAN_13,
-            BarcodeFormat.EAN_8,
-            BarcodeFormat.UPC_A,
-            BarcodeFormat.UPC_E,
-            BarcodeFormat.CODE_128,
-            BarcodeFormat.CODE_39,
-            BarcodeFormat.ITF,
-          ])
-          zxingReaderRef.current = new MultiFormatReader()
-          zxingReaderRef.current.setHints(hints)
-        }
-        const luminance = new RGBLuminanceSource(image.data, width, height)
-        const binary = new BinaryBitmap(new HybridBinarizer(luminance))
-        const result = zxingReaderRef.current.decode(binary)
-        if (result?.getText()) {
-          processScannedCode(result.getText())
-          return true
-        }
-      } catch {
-        // Try second pass below.
-      }
-      return false
+      // Pass 1: normal lighting
+      ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
+      ctx.drawImage(video, 0, 0, width, height)
+      const firstPass = await detectFromCurrentCanvas()
+      if (firstPass) return
+
+      // Pass 2: aggressive enhancement for dim light / iPhone low-light autofocus struggles
+      ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
+      ctx.drawImage(video, 0, 0, width, height)
+      await detectFromCurrentCanvas()
+    } finally {
+      isDecodingRef.current = false
     }
-
-    // Pass 1: normal lighting
-    ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
-    ctx.drawImage(video, 0, 0, width, height)
-    const firstPass = await detectFromCurrentCanvas()
-    if (firstPass) return
-
-    // Pass 2: aggressive enhancement for dim light / iPhone low-light autofocus struggles
-    ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
-    ctx.drawImage(video, 0, 0, width, height)
-    await detectFromCurrentCanvas()
   }
 
   const applyCameraEnhancements = async (stream: MediaStream) => {
@@ -331,27 +343,53 @@ export default function InventoryPage() {
     setScanStatus('Opening camera...')
     setIsScannerStarting(true)
     setShowScanner(true)
-    await refreshRearVideoInputs()
+    const rearList = await refreshRearVideoInputs()
 
     try {
-      const constraints: MediaStreamConstraints = {
-        audio: false,
-        video: selectedRearDeviceId
-          ? {
-              deviceId: { exact: selectedRearDeviceId },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
-              frameRate: { ideal: 30, max: 60 },
-            }
-          : {
-              facingMode: { ideal: 'environment' },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
-              frameRate: { ideal: 30, max: 60 },
-            },
-      }
+      const preferredRearId = selectedRearDeviceId || rearList[0]?.id || ''
+      const options: MediaStreamConstraints[] = [
+        ...(preferredRearId
+          ? [{
+              audio: false,
+              video: {
+                deviceId: { exact: preferredRearId },
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 30, max: 60 },
+              },
+            }]
+          : []),
+        {
+          audio: false,
+          video: {
+            facingMode: { exact: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30, max: 60 },
+          },
+        },
+        {
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 24, max: 30 },
+          },
+        },
+        { audio: false, video: true },
+      ]
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      let stream: MediaStream | null = null
+      for (const constraints of options) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints)
+          break
+        } catch {
+          // Continue through fallbacks
+        }
+      }
+      if (!stream) throw new Error('Unable to access camera')
       streamRef.current = stream
       await applyCameraEnhancements(stream)
       if (videoRef.current) {
@@ -362,7 +400,7 @@ export default function InventoryPage() {
       if (intervalRef.current) clearInterval(intervalRef.current)
       intervalRef.current = setInterval(() => {
         decodeWithCanvas().catch(() => {})
-      }, 140)
+      }, 90)
       setScanStatus('Scanner is active')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')
