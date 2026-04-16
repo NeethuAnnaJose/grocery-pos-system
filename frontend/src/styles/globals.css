@@ -58,6 +58,11 @@
   }
 }
 
+/* Native MLKit scanning: hide WebView UI behind camera when using startScan mode */
+body.barcode-scanner-active {
+  background: transparent !important;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

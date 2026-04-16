@@ -1,13 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import {
-  BinaryBitmap,
-  BarcodeFormat,
-  DecodeHintType,
-  HybridBinarizer,
-  MultiFormatReader,
-  RGBLuminanceSource,
-} from '@zxing/library'
+import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
+import Quagga from 'quagga'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
 import { InventoryItem, listInventoryItems, updateInventoryItem } from '@/services/inventoryFirebase'
@@ -382,6 +376,7 @@ export default function BillingPage() {
           }
         }
 
+        // ZXing fallback
         try {
           const image = ctx.getImageData(0, 0, width, height)
           if (!zxingReaderRef.current) {
@@ -402,11 +397,39 @@ export default function BillingPage() {
           const binary = new BinaryBitmap(new HybridBinarizer(luminance))
           const result = zxingReaderRef.current.decode(binary)
           if (result?.getText()) {
-            processScannedCode(result.getText())
+            await processScannedCode(result.getText())
             return true
           }
         } catch {
-          // Try dim-light pass below.
+          // ZXing failed, try QuaggaJS on same frame.
+          try {
+            const imageData = ctx.getImageData(0, 0, width, height)
+            const quaggaResult: any = await new Promise((resolve: (value: any) => void) => {
+              Quagga.decodeSingle(
+                {
+                  src: imageData,
+                  inputStream: {
+                    size: width,
+                  },
+                  numOfWorkers: 0,
+                  decoder: {
+                    readers: ['ean_reader', 'ean_8_reader', 'upc_reader', 'upc_e_reader', 'code_128_reader'],
+                  },
+                } as any,
+                (result: any) => resolve(result)
+              )
+            })
+            const text =
+              quaggaResult?.codeResult?.code ||
+              quaggaResult?.codeResult?.decodedCodes?.[0]?.error ||
+              null
+            if (text) {
+              await processScannedCode(String(text))
+              return true
+            }
+          } catch {
+            // Quagga also failed.
+          }
         }
         return false
       }
