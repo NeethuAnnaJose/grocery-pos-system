@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
-import Quagga from 'quagga'
+import { decodeQuaggaFromCanvas } from '@/lib/quaggaFrameDecode'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
 import {
@@ -11,6 +11,8 @@ import {
   listInventoryItems,
   updateInventoryItem,
 } from '@/services/inventoryFirebase'
+import { hasFirebaseConfig } from '@/lib/firebase'
+import { loadInventoryFromLocal, mergeInventoryLists, saveInventoryToLocal } from '@/services/inventoryLocalStore'
 
 type FormState = {
   name: string
@@ -19,8 +21,6 @@ type FormState = {
   quantity: string
   unit: string
 }
-
-const INVENTORY_CACHE_KEY = 'inventory_items_cache_v1'
 
 const emptyForm: FormState = {
   name: '',
@@ -81,6 +81,7 @@ export default function InventoryPage() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
+  const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
 
   const filteredItems = useMemo(() => {
@@ -93,24 +94,37 @@ export default function InventoryPage() {
 
   const cacheItems = (nextItems: InventoryItem[]) => {
     setItems(nextItems)
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(nextItems))
-    }
+    saveInventoryToLocal(nextItems)
   }
 
   const loadItems = async () => {
     try {
       setLoading(true)
-      const data = await listInventoryItems()
-      cacheItems(data)
-    } catch (error: any) {
-      const fallback =
-        typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]') : []
-      if (Array.isArray(fallback) && fallback.length) {
-        setItems(fallback)
-        toast.error('Firebase load failed. Showing cached items.')
-      } else {
-        toast.error(error?.message || 'Failed to load inventory')
+      const local = loadInventoryFromLocal()
+      if (local.length) {
+        setItems(local)
+      }
+
+      if (!hasFirebaseConfig) {
+        cacheItems(local)
+        if (!local.length) {
+          toast('Add items — they are saved on this device (browser storage).')
+        }
+        return
+      }
+
+      try {
+        const remote = await listInventoryItems()
+        const merged = mergeInventoryLists(remote, loadInventoryFromLocal())
+        cacheItems(merged)
+      } catch (error: any) {
+        const stillLocal = loadInventoryFromLocal()
+        if (stillLocal.length) {
+          setItems(stillLocal)
+          toast.error('Could not reach cloud. Showing saved inventory on this device.')
+        } else {
+          toast.error(error?.message || 'Failed to load inventory')
+        }
       }
     } finally {
       setLoading(false)
@@ -226,7 +240,7 @@ export default function InventoryPage() {
       const ctx = canvas.getContext('2d', { willReadFrequently: true })
       if (!ctx) return
 
-      const detectFromCurrentCanvas = async () => {
+      const detectFromCurrentCanvas = async (opts: { allowQuagga: boolean }) => {
         if ('BarcodeDetector' in window) {
           try {
             if (!detectorRef.current) {
@@ -244,7 +258,6 @@ export default function InventoryPage() {
           }
         }
 
-        // ZXing fallback
         try {
           const image = ctx.getImageData(0, 0, width, height)
           if (!zxingReaderRef.current) {
@@ -269,49 +282,32 @@ export default function InventoryPage() {
             return true
           }
         } catch {
-          // ZXing failed, try QuaggaJS on same frame.
-          try {
-            const imageData = ctx.getImageData(0, 0, width, height)
-            const quaggaResult: any = await new Promise((resolve: (value: any) => void) => {
-              Quagga.decodeSingle(
-                {
-                  src: imageData,
-                  inputStream: {
-                    size: width,
-                  },
-                  numOfWorkers: 0,
-                  decoder: {
-                    readers: ['ean_reader', 'ean_8_reader', 'upc_reader', 'upc_e_reader', 'code_128_reader'],
-                  },
-                } as any,
-                (result: any) => resolve(result)
-              )
-            })
-            const text =
-              quaggaResult?.codeResult?.code ||
-              quaggaResult?.codeResult?.decodedCodes?.[0]?.error ||
-              null
-            if (text) {
-              processScannedCode(String(text))
-              return true
-            }
-          } catch {
-            // Quagga also failed.
-          }
+          // ZXing miss — optional Quagga below (only on final pass; throttled).
+        }
+
+        if (!opts.allowQuagga) return false
+
+        const now = Date.now()
+        if (now - lastQuaggaAttemptRef.current < 450) return false
+        lastQuaggaAttemptRef.current = now
+        const qText = await decodeQuaggaFromCanvas(canvas)
+        if (qText) {
+          processScannedCode(qText)
+          return true
         }
         return false
       }
 
-      // Pass 1: normal lighting
+      // Pass 1: normal lighting (BarcodeDetector + ZXing only — fast path)
       ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
       ctx.drawImage(video, 0, 0, width, height)
-      const firstPass = await detectFromCurrentCanvas()
+      const firstPass = await detectFromCurrentCanvas({ allowQuagga: false })
       if (firstPass) return
 
-      // Pass 2: aggressive enhancement for dim light / iPhone low-light autofocus struggles
+      // Pass 2: stronger contrast + throttled Quagga (expects URL/data URL, not ImageData)
       ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
       ctx.drawImage(video, 0, 0, width, height)
-      await detectFromCurrentCanvas()
+      await detectFromCurrentCanvas({ allowQuagga: true })
     } finally {
       isDecodingRef.current = false
     }

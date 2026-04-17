@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
-import Quagga from 'quagga'
+import { decodeQuaggaFromCanvas } from '@/lib/quaggaFrameDecode'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
 import { InventoryItem, listInventoryItems, updateInventoryItem } from '@/services/inventoryFirebase'
+import { hasFirebaseConfig } from '@/lib/firebase'
+import { loadInventoryFromLocal, mergeInventoryLists, saveInventoryToLocal } from '@/services/inventoryLocalStore'
 
 type CartEntry = {
   id: string
@@ -15,7 +17,6 @@ type CartEntry = {
   unit: string
 }
 
-const INVENTORY_CACHE_KEY = 'inventory_items_cache_v1'
 const CART_CACHE_KEY = 'billing_cart_cache_v1'
 
 const normalizeBarcode = (value: string) =>
@@ -96,6 +97,7 @@ export default function BillingPage() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
+  const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
 
   const cartTotal = useMemo(
@@ -106,25 +108,36 @@ export default function BillingPage() {
   const persistInventoryItems = (nextItems: InventoryItem[]) => {
     inventoryRef.current = nextItems
     setItems(nextItems)
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(INVENTORY_CACHE_KEY, JSON.stringify(nextItems))
-    }
+    saveInventoryToLocal(nextItems)
   }
 
   const loadItems = async () => {
     try {
       setLoading(true)
       setIsRefreshingInventory(true)
-      const data = await listInventoryItems()
-      persistInventoryItems(data)
-    } catch {
-      const fallback =
-        typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]') : []
-      if (Array.isArray(fallback)) {
-        persistInventoryItems(fallback)
-        toast.error('Using cached inventory for billing')
-      } else {
-        toast.error('Failed to load inventory')
+      const local = loadInventoryFromLocal()
+      if (local.length) {
+        inventoryRef.current = local
+        setItems(local)
+      }
+
+      if (!hasFirebaseConfig) {
+        persistInventoryItems(loadInventoryFromLocal())
+        return
+      }
+
+      try {
+        const remote = await listInventoryItems()
+        const merged = mergeInventoryLists(remote, loadInventoryFromLocal())
+        persistInventoryItems(merged)
+      } catch {
+        const stillLocal = loadInventoryFromLocal()
+        if (stillLocal.length) {
+          persistInventoryItems(stillLocal)
+          toast.error('Could not reach cloud. Using inventory saved on this device.')
+        } else {
+          toast.error('Failed to load inventory')
+        }
       }
     } finally {
       setLoading(false)
@@ -317,10 +330,10 @@ export default function BillingPage() {
 
     let sourceItems = inventoryRef.current
     if (!sourceItems.length && typeof window !== 'undefined') {
-      const cached = JSON.parse(localStorage.getItem(INVENTORY_CACHE_KEY) || '[]')
-      if (Array.isArray(cached) && cached.length) {
-        sourceItems = cached as InventoryItem[]
-        persistInventoryItems(cached as InventoryItem[])
+      const cached = loadInventoryFromLocal()
+      if (cached.length) {
+        sourceItems = cached
+        persistInventoryItems(cached)
       }
     }
 
@@ -358,7 +371,7 @@ export default function BillingPage() {
       const ctx = canvas.getContext('2d', { willReadFrequently: true })
       if (!ctx) return
 
-      const detectFromCurrentCanvas = async () => {
+      const detectFromCurrentCanvas = async (opts: { allowQuagga: boolean }) => {
         if ('BarcodeDetector' in window) {
           try {
             if (!detectorRef.current) {
@@ -368,7 +381,7 @@ export default function BillingPage() {
             }
             const results = await detectorRef.current.detect(canvas)
             if (results?.[0]?.rawValue) {
-              processScannedCode(String(results[0].rawValue))
+              await processScannedCode(String(results[0].rawValue))
               return true
             }
           } catch {
@@ -376,7 +389,6 @@ export default function BillingPage() {
           }
         }
 
-        // ZXing fallback
         try {
           const image = ctx.getImageData(0, 0, width, height)
           if (!zxingReaderRef.current) {
@@ -401,47 +413,30 @@ export default function BillingPage() {
             return true
           }
         } catch {
-          // ZXing failed, try QuaggaJS on same frame.
-          try {
-            const imageData = ctx.getImageData(0, 0, width, height)
-            const quaggaResult: any = await new Promise((resolve: (value: any) => void) => {
-              Quagga.decodeSingle(
-                {
-                  src: imageData,
-                  inputStream: {
-                    size: width,
-                  },
-                  numOfWorkers: 0,
-                  decoder: {
-                    readers: ['ean_reader', 'ean_8_reader', 'upc_reader', 'upc_e_reader', 'code_128_reader'],
-                  },
-                } as any,
-                (result: any) => resolve(result)
-              )
-            })
-            const text =
-              quaggaResult?.codeResult?.code ||
-              quaggaResult?.codeResult?.decodedCodes?.[0]?.error ||
-              null
-            if (text) {
-              await processScannedCode(String(text))
-              return true
-            }
-          } catch {
-            // Quagga also failed.
-          }
+          // ZXing miss — optional Quagga below (final pass only; throttled).
+        }
+
+        if (!opts.allowQuagga) return false
+
+        const now = Date.now()
+        if (now - lastQuaggaAttemptRef.current < 450) return false
+        lastQuaggaAttemptRef.current = now
+        const qText = await decodeQuaggaFromCanvas(canvas)
+        if (qText) {
+          await processScannedCode(qText)
+          return true
         }
         return false
       }
 
       ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
       ctx.drawImage(video, 0, 0, width, height)
-      const firstPass = await detectFromCurrentCanvas()
+      const firstPass = await detectFromCurrentCanvas({ allowQuagga: false })
       if (firstPass) return
 
       ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
       ctx.drawImage(video, 0, 0, width, height)
-      await detectFromCurrentCanvas()
+      await detectFromCurrentCanvas({ allowQuagga: true })
     } finally {
       isDecodingRef.current = false
     }
