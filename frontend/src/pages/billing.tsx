@@ -459,13 +459,7 @@ export default function BillingPage() {
         const registerDetectedValue = async (value: string) => {
           const normalized = normalizeBarcode(value)
           if (!normalized) return false
-          if (cameraCandidateRef.current.code === normalized) {
-            cameraCandidateRef.current.count += 1
-          } else {
-            cameraCandidateRef.current = { code: normalized, count: 1 }
-          }
-          // Require two close hits to avoid accidental false-positive decodes.
-          if (cameraCandidateRef.current.count < 2) return false
+          // Accept first valid hit; duplicate suppression is already handled in processScannedCode.
           cameraCandidateRef.current = { code: '', count: 0 }
           scanMissCountRef.current = 0
           await processScannedCode(normalized)
@@ -657,24 +651,36 @@ export default function BillingPage() {
       streamRef.current = stream
       await applyCameraEnhancements(stream)
       if (videoRef.current) {
-        videoRef.current.srcObject = stream
+        const video = videoRef.current
+        video.srcObject = stream
+        await video.play().catch(() => {})
         await new Promise<void>((resolve) => {
+          let settled = false
+          const finish = () => {
+            if (settled) return
+            settled = true
+            resolve()
+          }
+          const timeout = window.setTimeout(finish, 1200)
+          const clear = () => {
+            window.clearTimeout(timeout)
+            finish()
+          }
           const video = videoRef.current
           if (!video) {
-            resolve()
+            clear()
             return
           }
           if (video.readyState >= 2) {
-            resolve()
+            clear()
             return
           }
           const onReady = () => {
             video.removeEventListener('loadeddata', onReady)
-            resolve()
+            clear()
           }
           video.addEventListener('loadeddata', onReady, { once: true })
         })
-        await videoRef.current.play().catch(() => {})
       }
 
       const tick = () => {
