@@ -103,6 +103,7 @@ export default function BillingPage() {
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
   const scanMissCountRef = useRef(0)
   const lastDecodeAtRef = useRef(0)
+  const cameraCandidateRef = useRef<{ code: string; count: number }>({ code: '', count: 0 })
   const scannerBufferRef = useRef('')
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -455,17 +456,39 @@ export default function BillingPage() {
       ) => {
         const { ctx, dw, dh } = surface
 
+        const registerDetectedValue = async (value: string) => {
+          const normalized = normalizeBarcode(value)
+          if (!normalized) return false
+          if (cameraCandidateRef.current.code === normalized) {
+            cameraCandidateRef.current.count += 1
+          } else {
+            cameraCandidateRef.current = { code: normalized, count: 1 }
+          }
+          // Require two close hits to avoid accidental false-positive decodes.
+          if (cameraCandidateRef.current.count < 2) return false
+          cameraCandidateRef.current = { code: '', count: 0 }
+          scanMissCountRef.current = 0
+          await processScannedCode(normalized)
+          return true
+        }
+
         if ('BarcodeDetector' in window) {
           try {
             if (!detectorRef.current) {
               detectorRef.current = new (window as any).BarcodeDetector({
-                formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'],
+                formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'codabar'],
               })
             }
+            // Detect directly from video first; this is often more reliable on desktop browsers.
+            const videoResults = await detectorRef.current.detect(video)
+            const videoValue = videoResults?.[0]?.rawValue
+            if (videoValue && (await registerDetectedValue(String(videoValue)))) {
+              return true
+            }
+
             const results = await detectorRef.current.detect(canvas)
             if (results?.[0]?.rawValue) {
-              await processScannedCode(String(results[0].rawValue))
-              return true
+              if (await registerDetectedValue(String(results[0].rawValue))) return true
             }
           } catch {
             // Fallback to ZXing below.
@@ -486,6 +509,7 @@ export default function BillingPage() {
             BarcodeFormat.CODE_128,
             BarcodeFormat.CODE_39,
             BarcodeFormat.ITF,
+            BarcodeFormat.CODABAR,
           ])
           if (opts.tryHarder) {
             hints.set(DecodeHintType.TRY_HARDER, true)
@@ -495,9 +519,7 @@ export default function BillingPage() {
           const binary = new BinaryBitmap(new HybridBinarizer(luminance))
           const result = zxingReaderRef.current.decode(binary)
           if (result?.getText()) {
-            scanMissCountRef.current = 0
-            await processScannedCode(result.getText())
-            return true
+            if (await registerDetectedValue(result.getText())) return true
           }
         } catch {
           // ZXing miss — optional Quagga below (final pass only; throttled).
@@ -508,11 +530,9 @@ export default function BillingPage() {
         const now = Date.now()
         if (now - lastQuaggaAttemptRef.current < 320) return false
         lastQuaggaAttemptRef.current = now
-        const qText = await decodeQuaggaFromCanvas(canvas, { maxSide: 560, timeoutMs: 300 })
+        const qText = await decodeQuaggaFromCanvas(canvas, { maxSide: 720, timeoutMs: 420 })
         if (qText) {
-          scanMissCountRef.current = 0
-          await processScannedCode(qText)
-          return true
+          if (await registerDetectedValue(qText)) return true
         }
         return false
       }
@@ -530,6 +550,7 @@ export default function BillingPage() {
       if (!surface3) return
       if (await detectOnSurface(surface3, { allowQuagga: true, tryHarder: true })) return
 
+      cameraCandidateRef.current = { code: '', count: 0 }
       scanMissCountRef.current += 1
       if (scanMissCountRef.current % 18 === 0) {
         setScanStatus('No barcode detected yet. Keep barcode centered and move 10-15 cm away.')
@@ -665,6 +686,7 @@ export default function BillingPage() {
       }
       scanMissCountRef.current = 0
       lastDecodeAtRef.current = 0
+      cameraCandidateRef.current = { code: '', count: 0 }
       scanRafRef.current = requestAnimationFrame(tick)
       setScanStatus('Scanner ready. Scan item to add directly.')
     } catch (error: any) {
