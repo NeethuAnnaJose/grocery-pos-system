@@ -90,6 +90,7 @@ export default function BillingPage() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const manualEntryRef = useRef<HTMLInputElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const detectorRef = useRef<any | null>(null)
   const isDecodingRef = useRef(false)
@@ -100,11 +101,24 @@ export default function BillingPage() {
   const lastScanAtRef = useRef(0)
   const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
+  const scannerBufferRef = useRef('')
+  const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const cartTotal = useMemo(
     () => cart.reduce((sum, entry) => sum + Number(entry.price || 0) * Number(entry.quantity || 0), 0),
     [cart]
   )
+  const barcodeIndex = useMemo(() => {
+    const map = new Map<string, InventoryItem>()
+    for (const item of items) {
+      for (const code of barcodeCandidates(item.barcode || '')) {
+        if (!map.has(code)) {
+          map.set(code, item)
+        }
+      }
+    }
+    return map
+  }, [items])
 
   const persistInventoryItems = (nextItems: InventoryItem[]) => {
     inventoryRef.current = nextItems
@@ -188,6 +202,63 @@ export default function BillingPage() {
   }
 
   useEffect(() => () => stopScanner(), [])
+
+  useEffect(() => {
+    const handleHardwareScanner = async (event: KeyboardEvent) => {
+      if (event.key === 'F8') {
+        event.preventDefault()
+        await startScanner()
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        manualEntryRef.current?.focus()
+        manualEntryRef.current?.select()
+        return
+      }
+
+      const target = event.target as HTMLElement | null
+      const isEditableTarget =
+        !!target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      if (isEditableTarget) return
+
+      if (event.key === 'Enter') {
+        const buffered = scannerBufferRef.current.trim()
+        scannerBufferRef.current = ''
+        if (scannerBufferTimerRef.current) {
+          clearTimeout(scannerBufferTimerRef.current)
+          scannerBufferTimerRef.current = null
+        }
+        if (buffered.length >= 6) {
+          event.preventDefault()
+          await processScannedCode(buffered)
+        }
+        return
+      }
+
+      if (event.key.length === 1) {
+        scannerBufferRef.current += event.key
+        if (scannerBufferTimerRef.current) {
+          clearTimeout(scannerBufferTimerRef.current)
+        }
+        scannerBufferTimerRef.current = setTimeout(() => {
+          scannerBufferRef.current = ''
+        }, 120)
+      }
+    }
+
+    window.addEventListener('keydown', handleHardwareScanner)
+    return () => {
+      window.removeEventListener('keydown', handleHardwareScanner)
+      if (scannerBufferTimerRef.current) {
+        clearTimeout(scannerBufferTimerRef.current)
+      }
+    }
+  }, [items, selectedRearDeviceId])
 
   const closeScanner = () => {
     setShowScanner(false)
@@ -291,6 +362,13 @@ export default function BillingPage() {
     if (!value) return
 
     const normalized = normalizeBarcode(value)
+    const quickHit = barcodeCandidates(normalized).map((candidate) => barcodeIndex.get(candidate)).find(Boolean)
+    if (quickHit) {
+      const success = await addToCart(quickHit, true)
+      if (success) toast.success(`Added: ${quickHit.name}`)
+      return
+    }
+
     const barcodeMatches = items.filter((item) => itemMatchesBarcode(item, normalized))
     if (barcodeMatches.length > 0) {
       const success = await addToCart(barcodeMatches[0], true)
@@ -338,7 +416,11 @@ export default function BillingPage() {
       }
     }
 
-    const match = sourceItems.find((item) => itemMatchesBarcode(item, code))
+    const quickMatch =
+      barcodeCandidates(code)
+        .map((candidate) => barcodeIndex.get(candidate))
+        .find(Boolean) || null
+    const match = quickMatch || sourceItems.find((item) => itemMatchesBarcode(item, code))
     if (!match) {
       setScanStatus(`Not found: ${code}`)
       toast.error(`Item not found for ${code}. Tap "Refresh Inventory Source" once.`)
@@ -346,10 +428,11 @@ export default function BillingPage() {
     }
 
     const existsAlready = cartRef.current.some((entry) => entry.id === match.id)
-    await addToCart(match, false)
+    const success = await addToCart(match, true)
+    if (!success) return
     if (existsAlready) {
-      setScanStatus(`Already in bill: ${match.name}`)
-      toast('Already added. Use + / - to change quantity.')
+      setScanStatus(`Quantity increased: ${match.name}`)
+      toast.success(`Quantity increased: ${match.name}`)
       return
     }
     setScanStatus(`Added to bill: ${match.name}`)
@@ -480,7 +563,7 @@ export default function BillingPage() {
     }
   }
 
-  const startScanner = async () => {
+  const startScanner = async (preferredDeviceId = '') => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setScanStatus('Camera is not available in this browser.')
       return
@@ -492,7 +575,7 @@ export default function BillingPage() {
     const rearList = await refreshRearVideoInputs()
 
     try {
-      const preferredRearId = selectedRearDeviceId || rearList[0]?.id || ''
+      const preferredRearId = preferredDeviceId || selectedRearDeviceId || rearList[0]?.id || ''
       const options: MediaStreamConstraints[] = [
         ...(preferredRearId
           ? [{
@@ -694,6 +777,7 @@ export default function BillingPage() {
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
           <div className="flex flex-wrap gap-2">
             <input
+              ref={manualEntryRef}
               className="input flex-1 min-w-[220px]"
               placeholder="Enter barcode or item name"
               value={manualEntry}
@@ -715,7 +799,7 @@ export default function BillingPage() {
             >
               Add To Bill
             </button>
-            <button className="btn btn-secondary min-w-32" onClick={startScanner} disabled={isScannerStarting}>
+            <button className="btn btn-secondary min-w-32" onClick={() => void startScanner()} disabled={isScannerStarting}>
               {isScannerStarting ? 'Opening...' : 'Scan To Bill'}
             </button>
             <button className="btn btn-outline min-w-40" onClick={loadItems} disabled={isRefreshingInventory}>
@@ -791,7 +875,14 @@ export default function BillingPage() {
               <select
                 className="input"
                 value={selectedRearDeviceId}
-                onChange={(e) => setSelectedRearDeviceId(e.target.value)}
+                onChange={(e) => {
+                  const nextId = e.target.value
+                  setSelectedRearDeviceId(nextId)
+                  if (!showScanner) return
+                  stopScanner()
+                  setScanStatus('Switching camera...')
+                  void startScanner(nextId)
+                }}
               >
                 {rearVideoInputs.map((cam) => (
                   <option key={cam.id} value={cam.id}>

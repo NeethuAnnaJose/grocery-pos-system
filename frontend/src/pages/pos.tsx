@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useRouter } from 'next/router'
 import { useSelector, useDispatch } from 'react-redux'
 import { RootState, AppDispatch } from '@/store'
@@ -93,6 +93,7 @@ export default function POS() {
   })
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const imageScanInputRef = useRef<HTMLInputElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const scanIntervalRef = useRef<NodeJS.Timeout | null>(null)
@@ -130,6 +131,22 @@ export default function POS() {
 
   useEffect(() => {
     const onKeyDown = async (event: KeyboardEvent) => {
+      if (event.key === 'F8') {
+        event.preventDefault()
+        unlockAudio()
+        setShowScanner(true)
+        setTimeout(() => {
+          startScanner()
+        }, 0)
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+        return
+      }
+
       const target = event.target as HTMLElement | null
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
         return
@@ -169,7 +186,8 @@ export default function POS() {
 
   const fetchItems = async () => {
     try {
-      const response = await itemsAPI.getItems({ limit: 100 })
+      // Keep a larger local catalog so barcode lookup works for most stores without extra API calls.
+      const response = await itemsAPI.getItems({ limit: 1000 })
       const itemsData = Array.isArray(response.data?.data?.items) ? response.data.data.items : []
       setAvailableItems(itemsData)
       if (typeof window !== 'undefined') {
@@ -1261,13 +1279,17 @@ export default function POS() {
     popup.document.close()
   }
 
-  const filteredItems = availableItems.filter(item => {
-    const matchesSearch = item.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         item.barcode?.includes(searchTerm)
-    const itemCategoryName = item.category?.name || 'Uncategorized'
-    const matchesCategory = !selectedCategory || itemCategoryName === selectedCategory
-    return matchesSearch && matchesCategory
-  })
+  const filteredItems = useMemo(() => {
+    const loweredSearch = searchTerm.toLowerCase()
+    return availableItems.filter((item) => {
+      const matchesSearch =
+        item.name.toLowerCase().includes(loweredSearch) ||
+        item.barcode?.includes(searchTerm)
+      const itemCategoryName = item.category?.name || 'Uncategorized'
+      const matchesCategory = !selectedCategory || itemCategoryName === selectedCategory
+      return matchesSearch && matchesCategory
+    })
+  }, [availableItems, searchTerm, selectedCategory])
 
   const selectedCustomer = customers.find(c => c.id === customerId)
 
@@ -1319,6 +1341,7 @@ export default function POS() {
             </div>
             <div className="mt-3 flex flex-col md:flex-row gap-3">
               <input
+                ref={searchInputRef}
                 type="text"
                 placeholder="Search items or scan barcode..."
                 value={searchTerm}
@@ -1746,6 +1769,16 @@ export default function POS() {
                 type="text"
                 value={manualScanCode}
                 onChange={(e) => setManualScanCode(e.target.value)}
+                onKeyDown={async (e) => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  if (!manualScanCode.trim()) {
+                    toast.error('Enter barcode first')
+                    return
+                  }
+                  await processScannedCode(manualScanCode.trim(), 'manual')
+                  setManualScanCode('')
+                }}
                 className="input flex-1"
                 placeholder="Enter barcode manually"
               />

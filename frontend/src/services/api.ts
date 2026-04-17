@@ -13,10 +13,23 @@ const api = axios.create({
   },
 })
 
+const shouldRetryRequest = (error: any) => {
+  const method = String(error?.config?.method || '').toLowerCase()
+  const isSafeMethod = method === 'get' || method === 'head'
+  if (!isSafeMethod) return false
+
+  const status = Number(error?.response?.status || 0)
+  const isRetriableStatus = status >= 500 || status === 429 || status === 408
+  const isNetworkFailure = !error?.response || error?.code === 'ECONNABORTED'
+  const alreadyRetried = !!error?.config?._retry
+
+  return !alreadyRetried && (isRetriableStatus || isNetworkFailure)
+}
+
 // Request interceptor to add auth token
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token')
+    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : ''
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }
@@ -30,7 +43,12 @@ api.interceptors.request.use(
 // Response interceptor to handle errors
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
+    if (shouldRetryRequest(error)) {
+      error.config._retry = true
+      return api.request(error.config)
+    }
+
     if (error.response?.status === 401) {
       const url = String(error.config?.url || '')
       // Do not redirect on failed login/register (same page, wrong password)
@@ -40,8 +58,9 @@ api.interceptors.response.use(
         !url.includes('/auth/forgot-password') &&
         !url.includes('/auth/reset-password')
       ) {
-        localStorage.removeItem('token')
         if (typeof window !== 'undefined') {
+          localStorage.removeItem('token')
+          localStorage.removeItem('local_auth_session_v1')
           Router.replace('/login').catch(() => {})
         }
       }

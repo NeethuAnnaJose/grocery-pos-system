@@ -76,6 +76,8 @@ export default function InventoryPage() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const nameInputRef = useRef<HTMLInputElement | null>(null)
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const detectorRef = useRef<any | null>(null)
   const isDecodingRef = useRef(false)
@@ -85,6 +87,8 @@ export default function InventoryPage() {
   const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
   const itemsRef = useRef<InventoryItem[]>([])
+  const scannerBufferRef = useRef('')
+  const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const filteredItems = useMemo(() => {
     const key = search.trim().toLowerCase()
@@ -93,6 +97,17 @@ export default function InventoryPage() {
       (item) => item.name.toLowerCase().includes(key) || item.barcode.toLowerCase().includes(key)
     )
   }, [items, search])
+  const barcodeIndex = useMemo(() => {
+    const map = new Map<string, InventoryItem>()
+    for (const item of items) {
+      for (const key of barcodeCandidates(item.barcode || '')) {
+        if (!map.has(key)) {
+          map.set(key, item)
+        }
+      }
+    }
+    return map
+  }, [items])
 
   const cacheItems = (nextItems: InventoryItem[]) => {
     setItems(nextItems)
@@ -161,6 +176,64 @@ export default function InventoryPage() {
 
   useEffect(() => () => stopScanner(), [])
 
+  useEffect(() => {
+    const handleHardwareScanner = (event: KeyboardEvent) => {
+      if (event.key === 'F8') {
+        event.preventDefault()
+        void startScanner()
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
+        event.preventDefault()
+        nameInputRef.current?.focus()
+        return
+      }
+
+      const target = event.target as HTMLElement | null
+      const isEditableTarget =
+        !!target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      if (isEditableTarget) return
+
+      if (event.key === 'Enter') {
+        const buffered = scannerBufferRef.current.trim()
+        scannerBufferRef.current = ''
+        if (scannerBufferTimerRef.current) {
+          clearTimeout(scannerBufferTimerRef.current)
+          scannerBufferTimerRef.current = null
+        }
+        if (buffered.length >= 6) {
+          event.preventDefault()
+          processScannedCode(buffered)
+        }
+        return
+      }
+
+      if (event.key.length === 1) {
+        scannerBufferRef.current += event.key
+        if (scannerBufferTimerRef.current) clearTimeout(scannerBufferTimerRef.current)
+        scannerBufferTimerRef.current = setTimeout(() => {
+          scannerBufferRef.current = ''
+        }, 120)
+      }
+    }
+
+    window.addEventListener('keydown', handleHardwareScanner)
+    return () => {
+      window.removeEventListener('keydown', handleHardwareScanner)
+      if (scannerBufferTimerRef.current) clearTimeout(scannerBufferTimerRef.current)
+    }
+  }, [items, selectedRearDeviceId])
+
   const closeScanner = () => {
     setShowScanner(false)
     stopScanner()
@@ -207,7 +280,8 @@ export default function InventoryPage() {
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
-    const match = itemsRef.current.find((item) => itemMatchesBarcode(item, code))
+    const quickMatch = barcodeCandidates(code).map((candidate) => barcodeIndex.get(candidate)).find(Boolean) || null
+    const match = quickMatch || itemsRef.current.find((item) => itemMatchesBarcode(item, code))
     if (match) {
       setEditingId(match.id)
       setForm({
@@ -356,7 +430,7 @@ export default function InventoryPage() {
     }
   }
 
-  const startScanner = async () => {
+  const startScanner = async (preferredDeviceId = '') => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setScanStatus('Camera is not available in this browser.')
       return
@@ -368,7 +442,7 @@ export default function InventoryPage() {
     const rearList = await refreshRearVideoInputs()
 
     try {
-      const preferredRearId = selectedRearDeviceId || rearList[0]?.id || ''
+      const preferredRearId = preferredDeviceId || selectedRearDeviceId || rearList[0]?.id || ''
       const options: MediaStreamConstraints[] = [
         ...(preferredRearId
           ? [{
@@ -549,6 +623,7 @@ export default function InventoryPage() {
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <input
+              ref={nameInputRef}
               className="input"
               placeholder="Item name"
               value={form.name}
@@ -586,7 +661,7 @@ export default function InventoryPage() {
             <button className="btn btn-primary min-w-32" onClick={handleSave} disabled={isSaving}>
               {isSaving ? 'Saving...' : editingId ? 'Update Item' : 'Add Item'}
             </button>
-            <button className="btn btn-secondary min-w-32" onClick={startScanner} disabled={isScannerStarting}>
+            <button className="btn btn-secondary min-w-32" onClick={() => void startScanner()} disabled={isScannerStarting}>
               {isScannerStarting ? 'Opening...' : 'Scan Barcode'}
             </button>
             <button
@@ -607,6 +682,7 @@ export default function InventoryPage() {
           <div className="flex flex-wrap gap-2 items-center justify-between">
             <h2 className="text-lg font-semibold">Inventory Items</h2>
             <input
+              ref={searchInputRef}
               className="input w-full sm:w-72"
               placeholder="Search name or barcode"
               value={search}
@@ -683,7 +759,14 @@ export default function InventoryPage() {
               <select
                 className="input"
                 value={selectedRearDeviceId}
-                onChange={(e) => setSelectedRearDeviceId(e.target.value)}
+                onChange={(e) => {
+                  const nextId = e.target.value
+                  setSelectedRearDeviceId(nextId)
+                  if (!showScanner) return
+                  stopScanner()
+                  setScanStatus('Switching camera...')
+                  void startScanner(nextId)
+                }}
               >
                 {rearVideoInputs.map((cam) => (
                   <option key={cam.id} value={cam.id}>

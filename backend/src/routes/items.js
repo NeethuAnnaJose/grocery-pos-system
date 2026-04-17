@@ -5,6 +5,16 @@ const { auth, staffAuth } = require('../middleware/auth');
 
 const router = express.Router();
 const prisma = new PrismaClient();
+const MAX_ITEMS_PAGE_SIZE = 1000;
+const ALLOWED_SORT_FIELDS = new Set([
+  'name',
+  'price',
+  'quantity',
+  'barcode',
+  'createdAt',
+  'updatedAt',
+  'expiryDate'
+]);
 
 const syncStockAndExpiryAlerts = async (item) => {
   const threshold = item.minQuantity || 5;
@@ -18,17 +28,50 @@ const syncStockAndExpiryAlerts = async (item) => {
   const expiringMessage = `Expiry warning: ${item.name} expires within 7 days`;
 
   if (isLowStock) {
-    await prisma.alert.create({
-      data: { type: 'LOW_STOCK', itemId: item.id, message: lowStockMessage }
+    const existingLowStockAlert = await prisma.alert.findFirst({
+      where: {
+        type: 'LOW_STOCK',
+        itemId: item.id,
+        isRead: false
+      }
     });
+    if (!existingLowStockAlert) {
+      await prisma.alert.create({
+        data: { type: 'LOW_STOCK', itemId: item.id, message: lowStockMessage }
+      });
+    }
   }
 
   if (isExpiringSoon) {
-    await prisma.alert.create({
-      data: { type: 'EXPIRY', itemId: item.id, message: expiringMessage }
+    const existingExpiryAlert = await prisma.alert.findFirst({
+      where: {
+        type: 'EXPIRY',
+        itemId: item.id,
+        isRead: false
+      }
     });
+    if (!existingExpiryAlert) {
+      await prisma.alert.create({
+        data: { type: 'EXPIRY', itemId: item.id, message: expiringMessage }
+      });
+    }
   }
 };
+
+const parsePaginationAndSort = (query) => {
+  const parsedPage = Number.parseInt(query.page, 10);
+  const parsedLimit = Number.parseInt(query.limit, 10);
+  const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+    ? Math.min(parsedLimit, MAX_ITEMS_PAGE_SIZE)
+    : 50;
+  const sortBy = ALLOWED_SORT_FIELDS.has(query.sortBy) ? query.sortBy : 'name';
+  const sortOrder = String(query.sortOrder || '').toLowerCase() === 'desc' ? 'desc' : 'asc';
+
+  return { page, limit, sortBy, sortOrder };
+};
+
+const createSafeOrderBy = (sortBy, sortOrder) => ({ [sortBy]: sortOrder });
 
 // @route   GET /api/items
 // @desc    Get all items with pagination and filtering
@@ -36,17 +79,14 @@ const syncStockAndExpiryAlerts = async (item) => {
 router.get('/', auth, async (req, res) => {
   try {
     const {
-      page = 1,
-      limit = 50,
       search,
       category,
       lowStock,
-      expiring,
-      sortBy = 'name',
-      sortOrder = 'asc'
+      expiring
     } = req.query;
+    const { page, limit, sortBy, sortOrder } = parsePaginationAndSort(req.query);
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (page - 1) * limit;
     const where = { isActive: true };
 
     // Search filter
@@ -87,9 +127,9 @@ router.get('/', auth, async (req, res) => {
             select: { id: true, name: true }
           }
         },
-        orderBy: { [sortBy]: sortOrder },
+        orderBy: createSafeOrderBy(sortBy, sortOrder),
         skip,
-        take: parseInt(limit)
+        take: limit
       }),
       prisma.item.count({ where })
     ]);
@@ -99,10 +139,10 @@ router.get('/', auth, async (req, res) => {
       data: {
         items,
         pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
+          page,
+          limit,
           total,
-          pages: Math.ceil(total / parseInt(limit))
+          pages: Math.ceil(total / limit)
         }
       }
     });
