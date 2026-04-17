@@ -1,300 +1,383 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
-import { drawVideoToDecodeCanvas } from '@/lib/drawVideoToDecodeCanvas'
-import { decodeQuaggaFromCanvas } from '@/lib/quaggaFrameDecode'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
-import { InventoryItem, listInventoryItems, updateInventoryItem } from '@/services/inventoryFirebase'
-import { hasFirebaseConfig } from '@/lib/firebase'
-import { loadInventoryFromLocal, mergeInventoryLists, saveInventoryToLocal } from '@/services/inventoryLocalStore'
+import { authAPI, itemsAPI, ordersAPI, productAPI } from '@/services/api'
 
-type CartEntry = {
+/**
+ * Mall-style billing counter: products live in the store DB (same API as POS).
+ * Staff signs in → catalog loads → scan (camera / USB scanner / manual) reserves stock and adds to bill → Complete sale creates an order.
+ */
+
+type CatalogItem = {
   id: string
   name: string
-  barcode: string
   price: number
   quantity: number
-  unit: string
+  barcode?: string
+  unit?: string
 }
 
-const CART_CACHE_KEY = 'billing_cart_cache_v1'
+type BillLine = {
+  id: string
+  name: string
+  price: number
+  quantity: number
+  barcode?: string
+  unit?: string
+}
 
-const normalizeBarcode = (value: string) =>
-  String(value || '')
-    .trim()
-    .replace(/\s+/g, '')
-    .replace(/-/g, '')
+const BILL_CACHE_KEY = 'billing_counter_cart_v2'
 
-const digitsOnly = (value: string) => String(value || '').replace(/\D/g, '')
+const normalizeBarcode = (value: string) => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const compact = raw.replace(/\s+/g, '').replace(/-/g, '')
+  if (/^\d+$/.test(compact)) return compact
+  return compact.toUpperCase()
+}
 
 const barcodeCandidates = (value: string) => {
   const normalized = normalizeBarcode(value)
   if (!normalized) return []
-  const candidates = new Set<string>([normalized, normalized.toUpperCase()])
-  const digits = digitsOnly(normalized)
-  if (digits) {
-    candidates.add(digits)
-  }
+  const candidates = new Set<string>([normalized])
   if (/^\d+$/.test(normalized)) {
     const noLeadingZero = normalized.replace(/^0+/, '') || '0'
     candidates.add(noLeadingZero)
     if (normalized.length === 12) candidates.add(`0${normalized}`)
     if (normalized.length === 13 && normalized.startsWith('0')) candidates.add(normalized.slice(1))
   }
-  if (digits) {
-    const noLeadingZero = digits.replace(/^0+/, '') || '0'
-    candidates.add(noLeadingZero)
-    if (digits.length === 12) candidates.add(`0${digits}`)
-    if (digits.length === 13 && digits.startsWith('0')) candidates.add(digits.slice(1))
-  }
   return Array.from(candidates)
 }
 
-const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
-  const itemCodes = new Set(barcodeCandidates(item.barcode || ''))
-  if (!itemCodes.size) return false
-  const scannedCandidates = barcodeCandidates(scannedValue)
-  if (scannedCandidates.some((candidate) => itemCodes.has(candidate))) {
-    return true
-  }
-
-  // Additional tolerance: scanners may include prefixes/suffixes around numeric barcode payload.
-  const scannedDigits = digitsOnly(scannedValue)
-  const itemDigits = digitsOnly(item.barcode || '')
-  if (!scannedDigits || !itemDigits) return false
-  if (scannedDigits === itemDigits) return true
-  if (scannedDigits.length >= 8 && itemDigits.length >= 8) {
-    return scannedDigits.endsWith(itemDigits) || itemDigits.endsWith(scannedDigits)
-  }
-  return false
+const itemMatchesBarcode = (item: CatalogItem, scannedValue: string) => {
+  const itemCandidates = barcodeCandidates(item.barcode || '')
+  if (!itemCandidates.length) return false
+  const scannedCandidates = new Set(barcodeCandidates(scannedValue))
+  return itemCandidates.some((c) => scannedCandidates.has(c))
 }
 
-/** Strip common GS1 / scanner prefixes so inventory EAN matches scanned payload. */
-const stripKnownScanPrefixes = (raw: string) => {
-  let s = normalizeBarcode(raw)
-  if (!s) return ''
-  // Numeric payload embedded in longer string (e.g. Code128 with extra chars)
-  const onlyDigits = digitsOnly(s)
-  if (onlyDigits.length >= 8 && onlyDigits.length <= 14 && /^\d+$/.test(onlyDigits)) {
-    return onlyDigits
-  }
-  return s
-}
-
-/** Always use latest inventory from ref (avoids stale closure in camera RAF loop). */
-const findInventoryItemByScan = (rawCode: string, list: InventoryItem[]): InventoryItem | null => {
-  const variants = new Set<string>()
-  for (const v of [rawCode, stripKnownScanPrefixes(rawCode), normalizeBarcode(rawCode)]) {
-    if (!v) continue
-    variants.add(v)
-    barcodeCandidates(v).forEach((c) => variants.add(c))
-  }
-  for (const candidate of Array.from(variants)) {
-    if (!candidate) continue
-    const hit = list.find((item) => itemMatchesBarcode(item, candidate))
-    if (hit) return hit
-  }
-  return null
-}
+const getStoredToken = () => (typeof window !== 'undefined' ? localStorage.getItem('token') : '')
 
 export default function BillingPage() {
   const { authLoading, currentUserEmail } = useRequireAuth()
-  const [items, setItems] = useState<InventoryItem[]>([])
-  const [cart, setCart] = useState<CartEntry[]>([])
+  const [storeToken, setStoreToken] = useState('')
+  const [staffEmail, setStaffEmail] = useState('')
+  const [staffPassword, setStaffPassword] = useState('')
+  const [loginSubmitting, setLoginSubmitting] = useState(false)
+
+  const [catalog, setCatalog] = useState<CatalogItem[]>([])
+  const [cart, setCart] = useState<BillLine[]>([])
   const [manualEntry, setManualEntry] = useState('')
-  const [loading, setLoading] = useState(true)
+  const [loadingCatalog, setLoadingCatalog] = useState(false)
 
   const [showScanner, setShowScanner] = useState(false)
   const [scanStatus, setScanStatus] = useState('')
+  const [scanError, setScanError] = useState('')
   const [manualScanCode, setManualScanCode] = useState('')
-  const [isScannerStarting, setIsScannerStarting] = useState(false)
-  const [isRefreshingInventory, setIsRefreshingInventory] = useState(false)
+  const [isScanStarting, setIsScanStarting] = useState(false)
+  const [isCheckoutLoading, setIsCheckoutLoading] = useState(false)
   const [isPrinting, setIsPrinting] = useState(false)
-  const [torchSupported, setTorchSupported] = useState(false)
-  const [torchEnabled, setTorchEnabled] = useState(false)
+  const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'UPI' | 'CARD' | 'CREDIT' | 'BANK_TRANSFER'>('CASH')
+  const [preferredFacingMode, setPreferredFacingMode] = useState<'environment' | 'user'>('environment')
   const [rearVideoInputs, setRearVideoInputs] = useState<Array<{ id: string; label: string }>>([])
   const [selectedRearDeviceId, setSelectedRearDeviceId] = useState('')
+  const [isOffline, setIsOffline] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const manualEntryRef = useRef<HTMLInputElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const detectorRef = useRef<any | null>(null)
-  const isDecodingRef = useRef(false)
-  const cartRef = useRef<CartEntry[]>([])
-  const inventoryRef = useRef<InventoryItem[]>([])
-  const scanRafRef = useRef<number | null>(null)
-  const lastScannedRef = useRef('')
+  const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const zxingReaderRef = useRef<any>(null)
+  const processScanRef = useRef<(code: string, source?: 'camera' | 'manual' | 'external-scanner') => Promise<void>>()
   const lastScanAtRef = useRef(0)
-  const lastQuaggaAttemptRef = useRef(0)
-  const zxingReaderRef = useRef<MultiFormatReader | null>(null)
+  const lastScannedCodeRef = useRef('')
   const scanMissCountRef = useRef(0)
-  const lastDecodeAtRef = useRef(0)
+  const isProcessingScanRef = useRef(false)
+  const localBarcodeMapRef = useRef<Map<string, CatalogItem>>(new Map())
   const cameraCandidateRef = useRef<{ code: string; count: number }>({ code: '', count: 0 })
   const scannerBufferRef = useRef('')
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const processScannedCodeRef = useRef<(raw: string) => Promise<void>>(async () => {})
+  const cartRef = useRef<BillLine[]>([])
+  const catalogRef = useRef<CatalogItem[]>([])
 
   const cartTotal = useMemo(
-    () => cart.reduce((sum, entry) => sum + Number(entry.price || 0) * Number(entry.quantity || 0), 0),
+    () => cart.reduce((sum, line) => sum + Number(line.price || 0) * Number(line.quantity || 0), 0),
     [cart]
   )
-  const barcodeIndex = useMemo(() => {
-    const map = new Map<string, InventoryItem>()
-    for (const item of items) {
-      for (const code of barcodeCandidates(item.barcode || '')) {
-        if (!map.has(code)) {
-          map.set(code, item)
-        }
-      }
-    }
-    return map
-  }, [items])
-
-  const persistInventoryItems = (nextItems: InventoryItem[]) => {
-    inventoryRef.current = nextItems
-    setItems(nextItems)
-    saveInventoryToLocal(nextItems)
-  }
-
-  const loadItems = async () => {
-    try {
-      setLoading(true)
-      setIsRefreshingInventory(true)
-      const local = loadInventoryFromLocal()
-      if (local.length) {
-        inventoryRef.current = local
-        setItems(local)
-      }
-
-      if (!hasFirebaseConfig) {
-        persistInventoryItems(loadInventoryFromLocal())
-        return
-      }
-
-      try {
-        const remote = await listInventoryItems()
-        const merged = mergeInventoryLists(remote, loadInventoryFromLocal())
-        persistInventoryItems(merged)
-      } catch {
-        const stillLocal = loadInventoryFromLocal()
-        if (stillLocal.length) {
-          persistInventoryItems(stillLocal)
-          toast.error('Could not reach cloud. Using inventory saved on this device.')
-        } else {
-          toast.error('Failed to load inventory')
-        }
-      }
-    } finally {
-      setLoading(false)
-      setIsRefreshingInventory(false)
-    }
-  }
 
   useEffect(() => {
-    loadItems()
-  }, [])
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    const cached = JSON.parse(localStorage.getItem(CART_CACHE_KEY) || '[]')
-    if (Array.isArray(cached)) {
-      cartRef.current = cached
-      setCart(cached)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    localStorage.setItem(CART_CACHE_KEY, JSON.stringify(cart))
     cartRef.current = cart
   }, [cart])
 
   useEffect(() => {
-    inventoryRef.current = items
-  }, [items])
-
-  const stopScanner = () => {
-    if (scanRafRef.current !== null) {
-      cancelAnimationFrame(scanRafRef.current)
-      scanRafRef.current = null
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop())
-      streamRef.current = null
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null
-    }
-    setTorchSupported(false)
-    setTorchEnabled(false)
-    detectorRef.current = null
-    isDecodingRef.current = false
-  }
-
-  useEffect(() => () => stopScanner(), [])
+    catalogRef.current = catalog
+  }, [catalog])
 
   useEffect(() => {
-    const handleHardwareScanner = async (event: KeyboardEvent) => {
-      if (event.key === 'F8') {
-        event.preventDefault()
-        await startScanner()
-        return
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
-        event.preventDefault()
-        manualEntryRef.current?.focus()
-        manualEntryRef.current?.select()
-        return
-      }
+    setStoreToken(getStoredToken() || '')
+  }, [])
 
-      const target = event.target as HTMLElement | null
-      const isEditableTarget =
-        !!target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      if (isEditableTarget) return
-
-      if (event.key === 'Enter') {
-        const buffered = scannerBufferRef.current.trim()
-        scannerBufferRef.current = ''
-        if (scannerBufferTimerRef.current) {
-          clearTimeout(scannerBufferTimerRef.current)
-          scannerBufferTimerRef.current = null
-        }
-        if (buffered.length >= 6) {
-          event.preventDefault()
-          await processScannedCodeRef.current(buffered)
-        }
-        return
-      }
-
-      if (event.key.length === 1) {
-        scannerBufferRef.current += event.key
-        if (scannerBufferTimerRef.current) {
-          clearTimeout(scannerBufferTimerRef.current)
-        }
-        scannerBufferTimerRef.current = setTimeout(() => {
-          scannerBufferRef.current = ''
-        }, 120)
+  useEffect(() => {
+    const map = new Map<string, CatalogItem>()
+    for (const item of catalog) {
+      for (const key of barcodeCandidates(item.barcode || '')) {
+        if (!map.has(key)) map.set(key, item)
       }
     }
+    localBarcodeMapRef.current = map
+  }, [catalog])
 
-    window.addEventListener('keydown', handleHardwareScanner)
-    return () => {
-      window.removeEventListener('keydown', handleHardwareScanner)
-      if (scannerBufferTimerRef.current) {
-        clearTimeout(scannerBufferTimerRef.current)
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = localStorage.getItem(BILL_CACHE_KEY)
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        cartRef.current = parsed
+        setCart(parsed)
       }
+    } catch {
+      /* ignore */
     }
-  }, [items, selectedRearDeviceId])
+  }, [])
 
-  const closeScanner = () => {
-    setShowScanner(false)
-    stopScanner()
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(BILL_CACHE_KEY, JSON.stringify(cart))
+  }, [cart])
+
+  const loadCatalog = useCallback(async () => {
+    if (!getStoredToken()) return
+    try {
+      setLoadingCatalog(true)
+      const response = await itemsAPI.getItems({ limit: 2000 })
+      const rows = Array.isArray(response.data?.data?.items) ? response.data.data.items : []
+      setCatalog(rows)
+      setIsOffline(false)
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('cached_products', JSON.stringify(rows))
+      }
+    } catch {
+      const cached =
+        typeof window !== 'undefined' ? JSON.parse(localStorage.getItem('cached_products') || '[]') : []
+      if (Array.isArray(cached) && cached.length) {
+        setCatalog(cached)
+        setIsOffline(true)
+        toast.error('Using offline product cache. Reconnect and refresh.')
+      } else {
+        setCatalog([])
+        toast.error('Could not load product catalog. Check API login and server.')
+      }
+    } finally {
+      setLoadingCatalog(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (storeToken) void loadCatalog()
+  }, [storeToken, loadCatalog])
+
+  const handleStaffLogin = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const email = staffEmail.trim().toLowerCase()
+    if (!email || !staffPassword) {
+      toast.error('Enter staff email and password (same as POS / store server).')
+      return
+    }
+    setLoginSubmitting(true)
+    try {
+      const response = await authAPI.login({ email, password: staffPassword })
+      const body = response.data
+      const token = body?.data?.token
+      if (!token) {
+        toast.error(body?.message || 'Login failed')
+        return
+      }
+      localStorage.setItem('token', token)
+      setStoreToken(token)
+      setStaffPassword('')
+      toast.success('Store connected. Catalog loading…')
+      await loadCatalog()
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Store login failed')
+    } finally {
+      setLoginSubmitting(false)
+    }
+  }
+
+  const fetchProductByBarcode = async (code: string) => {
+    const normalizedCode = normalizeBarcode(code)
+    if (!normalizedCode) return null
+    for (const candidate of barcodeCandidates(normalizedCode)) {
+      const hit = localBarcodeMapRef.current.get(candidate)
+      if (hit) return hit
+    }
+    if (isOffline) return null
+    try {
+      const response = await productAPI.getByBarcode(normalizedCode)
+      return response.data?.data?.product || null
+    } catch {
+      return catalogRef.current.find((item) => itemMatchesBarcode(item, normalizedCode)) || null
+    }
+  }
+
+  const addLineToBill = async (item: CatalogItem) => {
+    if (item.quantity === 0) {
+      toast.error('Out of stock')
+      return false
+    }
+    const inBill = cartRef.current.find((l) => l.id === item.id)
+    if (inBill && inBill.quantity >= item.quantity) {
+      toast.error('Cannot add more than available stock')
+      return false
+    }
+    try {
+      await itemsAPI.updateStock(item.id, {
+        quantity: 1,
+        type: 'STOCK_OUT',
+        reason: 'Billing counter',
+      })
+      setCatalog((prev) =>
+        prev.map((p) => (p.id === item.id ? { ...p, quantity: Math.max(0, p.quantity - 1) } : p))
+      )
+      setCart((prev) => {
+        const cur = prev.find((l) => l.id === item.id)
+        if (cur) {
+          return prev.map((l) => (l.id === item.id ? { ...l, quantity: l.quantity + 1 } : l))
+        }
+        return [
+          ...prev,
+          {
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            quantity: 1,
+            barcode: item.barcode,
+            unit: item.unit || 'pcs',
+          },
+        ]
+      })
+      return true
+    } catch (err: any) {
+      if (!err?.response) {
+        setCatalog((prev) =>
+          prev.map((p) => (p.id === item.id ? { ...p, quantity: Math.max(0, p.quantity - 1) } : p))
+        )
+        setCart((prev) => {
+          const cur = prev.find((l) => l.id === item.id)
+          if (cur) return prev.map((l) => (l.id === item.id ? { ...l, quantity: l.quantity + 1 } : l))
+          return [
+            ...prev,
+            {
+              id: item.id,
+              name: item.name,
+              price: item.price,
+              quantity: 1,
+              barcode: item.barcode,
+              unit: item.unit || 'pcs',
+            },
+          ]
+        })
+        toast.success(`${item.name} added (offline)`)
+        return true
+      }
+      toast.error(err?.response?.data?.message || 'Could not reserve stock')
+      return false
+    }
+  }
+
+  const processScannedCode = async (rawCode: string, source: 'camera' | 'manual' | 'external-scanner' = 'camera') => {
+    if (!storeToken) {
+      toast.error('Sign in to store server first')
+      return
+    }
+    if (isProcessingScanRef.current) return
+    const code = String(rawCode || '').trim()
+    if (!code) return
+    const normalizedCode = normalizeBarcode(code)
+    const now = Date.now()
+    if (source !== 'manual' && normalizedCode === lastScannedCodeRef.current && now - lastScanAtRef.current < 1200) {
+      return
+    }
+    lastScanAtRef.current = now
+    lastScannedCodeRef.current = normalizedCode
+    setScanStatus('Looking up product…')
+    isProcessingScanRef.current = true
+    try {
+      const product = await fetchProductByBarcode(normalizedCode)
+      if (product) {
+        const ok = await addLineToBill(product)
+        if (ok) {
+          setScanStatus(`Added: ${product.name}`)
+          toast.success(`Added: ${product.name}`)
+          setShowScanner(false)
+          stopScanner()
+        }
+      } else {
+        setScanStatus(`Not in catalog: ${normalizedCode}`)
+        toast.error(`No product for barcode ${normalizedCode}`)
+        if (source === 'camera') {
+          setShowScanner(false)
+          stopScanner()
+        }
+      }
+    } finally {
+      isProcessingScanRef.current = false
+    }
+  }
+
+  useEffect(() => {
+    processScanRef.current = processScannedCode
+  }, [processScannedCode])
+
+  const addToBillByQuery = async (query: string) => {
+    const value = query.trim()
+    if (!value) return
+    if (!storeToken) {
+      toast.error('Sign in to store server first')
+      return
+    }
+    const normalized = normalizeBarcode(value)
+    const product = await fetchProductByBarcode(normalized)
+    if (product) {
+      const ok = await addLineToBill(product)
+      if (ok) toast.success(`Added: ${product.name}`)
+      return
+    }
+    const lowered = value.toLowerCase()
+    const byName = catalog.filter((p) => p.name.toLowerCase().includes(lowered))
+    if (byName.length === 1) {
+      const ok = await addLineToBill(byName[0])
+      if (ok) toast.success(`Added: ${byName[0].name}`)
+      return
+    }
+    toast.error('Product not found. Add it in POS / inventory admin first.')
+  }
+
+  const isExpectedDecodeMiss = (error: any) => {
+    const name = String(error?.name || '')
+    const message = String(error?.message || '')
+    return (
+      name === 'NotFoundException' ||
+      /no multiformat readers were able to detect the code/i.test(message) ||
+      /not found/i.test(message)
+    )
+  }
+
+  const stopScanner = () => {
+    if (scanIntervalRef.current) {
+      clearInterval(scanIntervalRef.current)
+      scanIntervalRef.current = null
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) videoRef.current.srcObject = null
+    cameraCandidateRef.current = { code: '', count: 0 }
   }
 
   const scoreCameraLabel = (label: string) => {
@@ -311,554 +394,357 @@ export default function BillingPage() {
   const refreshRearVideoInputs = async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices()
-      const videoDevices = devices.filter((entry) => entry.kind === 'videoinput')
+      const videoDevices = devices.filter((d) => d.kind === 'videoinput')
       const ranked = [...videoDevices].sort((a, b) => scoreCameraLabel(b.label) - scoreCameraLabel(a.label))
-      const likelyRear = ranked.filter((entry) => scoreCameraLabel(entry.label) >= 0)
-      const usable = (likelyRear.length ? likelyRear : ranked).map((entry, index) => ({
-        id: entry.deviceId,
-        label: entry.label || `Camera ${index + 1}`,
+      const likelyRear = ranked.filter((d) => scoreCameraLabel(d.label) >= 0)
+      const usable = (likelyRear.length ? likelyRear : ranked).map((d, i) => ({
+        id: d.deviceId,
+        label: d.label?.trim() || `Camera ${i + 1}`,
       }))
       setRearVideoInputs(usable)
-      if (!selectedRearDeviceId && usable[0]?.id) {
-        setSelectedRearDeviceId(usable[0].id)
-      }
-      return usable
+      const resolved = usable.find((d) => d.id === selectedRearDeviceId)?.id || usable[0]?.id || ''
+      if (resolved && resolved !== selectedRearDeviceId) setSelectedRearDeviceId(resolved)
+      return resolved
     } catch {
-      return []
+      return selectedRearDeviceId
     }
   }
 
-  const changeInventoryQty = async (itemId: string, delta: number) => {
-    const source = inventoryRef.current.find((entry) => entry.id === itemId)
-    if (!source) return false
-    const currentQty = Number(source.quantity || 0)
-    const nextQty = currentQty + delta
-    if (nextQty < 0) return false
-
-    const nextItems = inventoryRef.current.map((entry) =>
-      entry.id === itemId ? { ...entry, quantity: nextQty } : entry
-    )
-    persistInventoryItems(nextItems)
-
+  const startScanner = async (facingMode: 'environment' | 'user' = preferredFacingMode) => {
+    if (!storeToken) {
+      toast.error('Sign in to store server before scanning')
+      return
+    }
+    const nav = typeof navigator !== 'undefined' ? navigator : null
+    const gUM = nav?.mediaDevices?.getUserMedia?.bind(nav.mediaDevices)
+    if (!gUM) {
+      setScanError('Camera not available in this browser.')
+      return
+    }
+    setIsScanStarting(true)
+    setScanError('')
+    setScanStatus('Starting camera…')
+    setShowScanner(true)
     try {
-      await updateInventoryItem(source.id, {
-        name: source.name,
-        barcode: source.barcode,
-        price: Number(source.price || 0),
-        quantity: nextQty,
-        unit: source.unit || 'pcs',
-      })
-    } catch {
-      // Keep local state aligned to user action for smooth billing flow.
-    }
-
-    return true
-  }
-
-  const addToCart = async (item: InventoryItem, incrementIfExists = true) => {
-    const existing = cartRef.current.find((entry) => entry.id === item.id)
-    const shouldIncrease = existing ? incrementIfExists : true
-    if (!shouldIncrease) return true
-
-    const ok = await changeInventoryQty(item.id, -1)
-    if (!ok) {
-      toast.error(`Out of stock: ${item.name}`)
-      return false
-    }
-
-    setCart((prev) => {
-      const current = prev.find((entry) => entry.id === item.id)
-      if (current) {
-        return prev.map((entry) =>
-          entry.id === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry
-        )
-      }
-      return [
-        ...prev,
-        {
-          id: item.id,
-          name: item.name,
-          barcode: item.barcode,
-          price: Number(item.price || 0),
-          quantity: 1,
-          unit: item.unit || 'pcs',
-        },
+      const rearId = facingMode === 'environment' ? selectedRearDeviceId || (await refreshRearVideoInputs()) : ''
+      const fallbackFacing = facingMode === 'environment' ? 'user' : 'environment'
+      const tries: MediaStreamConstraints[] = [
+        ...(rearId
+          ? [{ video: { deviceId: { exact: rearId }, width: { ideal: 1280 }, height: { ideal: 720 } } }]
+          : []),
+        { video: { facingMode: { exact: facingMode }, width: { ideal: 1920 }, height: { ideal: 1080 } } },
+        { video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } } },
+        { video: { facingMode: { ideal: fallbackFacing }, width: { ideal: 1280 }, height: { ideal: 720 } } },
+        { video: true },
       ]
-    })
-
-    return true
-  }
-
-  const addToBillByQuery = async (query: string) => {
-    const value = query.trim()
-    if (!value) return
-
-    const normalized = normalizeBarcode(value)
-    const quickHit = barcodeCandidates(normalized).map((candidate) => barcodeIndex.get(candidate)).find(Boolean)
-    const fromRef = findInventoryItemByScan(value, inventoryRef.current.length ? inventoryRef.current : items)
-    const barcodeHit = quickHit || fromRef
-    if (barcodeHit) {
-      const success = await addToCart(barcodeHit, true)
-      if (success) toast.success(`Added: ${barcodeHit.name}`)
-      return
-    }
-
-    const barcodeMatches = items.filter((item) => itemMatchesBarcode(item, normalized))
-    if (barcodeMatches.length > 0) {
-      const success = await addToCart(barcodeMatches[0], true)
-      if (success) toast.success(`Added: ${barcodeMatches[0].name}`)
-      return
-    }
-
-    const lowered = value.toLowerCase()
-    const exactName = items.find((item) => item.name.trim().toLowerCase() === lowered)
-    if (exactName) {
-      const success = await addToCart(exactName, true)
-      if (success) toast.success(`Added: ${exactName.name}`)
-      return
-    }
-
-    const contains = items.filter((item) => item.name.toLowerCase().includes(lowered))
-    if (contains.length === 1) {
-      const success = await addToCart(contains[0], true)
-      if (success) toast.success(`Added: ${contains[0].name}`)
-      return
-    }
-    if (contains.length > 1) {
-      toast.error('Multiple items matched. Enter exact barcode or full name.')
-      return
-    }
-
-    toast.error('Item not found in inventory. Add it in Inventory section first.')
-  }
-
-  const processScannedCode = async (rawCode: string) => {
-    const code = normalizeBarcode(rawCode)
-    if (!code) return
-
-    const now = Date.now()
-    if (lastScannedRef.current === code && now - lastScanAtRef.current < 400) return
-    lastScannedRef.current = code
-    lastScanAtRef.current = now
-
-    let sourceItems = inventoryRef.current
-    if (!sourceItems.length && typeof window !== 'undefined') {
-      const cached = loadInventoryFromLocal()
-      if (cached.length) {
-        sourceItems = cached
-        persistInventoryItems(cached)
+      let stream: MediaStream | null = null
+      for (const c of tries) {
+        try {
+          stream = await gUM(c)
+          break
+        } catch {
+          /* next */
+        }
       }
-    }
+      if (!stream) throw new Error('Could not open camera')
+      streamRef.current = stream
+      if (videoRef.current) {
+        const v = videoRef.current
+        v.srcObject = stream
+        v.muted = true
+        v.setAttribute('playsinline', 'true')
+        await v.play().catch(() => {})
+      }
 
-    const match = findInventoryItemByScan(rawCode, sourceItems)
-    if (!match) {
-      setScanStatus(`Not found: ${code}`)
-      toast.error(`Item not found for ${code}. Tap "Refresh Inventory Source" once.`)
-      return
-    }
+      const BarcodeDetectorCtor = (window as any).BarcodeDetector
+      const detector = BarcodeDetectorCtor
+        ? new BarcodeDetectorCtor({
+            formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'qr_code'],
+          })
+        : null
+      const needFrames = detector ? 1 : 2
 
-    const existsAlready = cartRef.current.some((entry) => entry.id === match.id)
-    const success = await addToCart(match, true)
-    if (!success) return
-    if (existsAlready) {
-      setScanStatus(`Quantity increased: ${match.name}`)
-      toast.success(`Quantity increased: ${match.name}`)
-      return
+      if (!detector) {
+        const zxing = await import('@zxing/library')
+        if (!zxingReaderRef.current) {
+          const hints = new Map()
+          hints.set(zxing.DecodeHintType.POSSIBLE_FORMATS, [
+            zxing.BarcodeFormat.EAN_13,
+            zxing.BarcodeFormat.EAN_8,
+            zxing.BarcodeFormat.UPC_A,
+            zxing.BarcodeFormat.UPC_E,
+            zxing.BarcodeFormat.CODE_128,
+            zxing.BarcodeFormat.CODE_39,
+            zxing.BarcodeFormat.ITF,
+            zxing.BarcodeFormat.QR_CODE,
+          ])
+          const reader = new zxing.MultiFormatReader()
+          reader.setHints(hints)
+          zxingReaderRef.current = { zxing, reader }
+        }
+      }
+
+      scanIntervalRef.current = setInterval(async () => {
+        if (!videoRef.current || !canvasRef.current || videoRef.current.readyState < 2) return
+        const video = videoRef.current
+        const canvas = canvasRef.current
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return
+        ctx.filter = 'grayscale(100%) contrast(180%) brightness(110%)'
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+        try {
+          let raw = ''
+          if (detector) {
+            const results = await detector.detect(canvas)
+            raw = results?.[0]?.rawValue || ''
+          } else if (zxingReaderRef.current) {
+            const { zxing, reader } = zxingReaderRef.current
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+            const source = new zxing.RGBLuminanceSource(imageData.data, canvas.width, canvas.height)
+            const bitmap = new zxing.BinaryBitmap(new zxing.HybridBinarizer(source))
+            const result = reader.decode(bitmap)
+            raw = result?.getText?.() || result?.text || ''
+            reader.reset?.()
+          }
+          if (raw) {
+            const norm = normalizeBarcode(raw)
+            const cur = cameraCandidateRef.current
+            if (cur.code === norm) cur.count += 1
+            else cameraCandidateRef.current = { code: norm, count: 1 }
+            if (cameraCandidateRef.current.count >= needFrames) {
+              scanMissCountRef.current = 0
+              cameraCandidateRef.current = { code: '', count: 0 }
+              await processScanRef.current?.(norm, 'camera')
+            }
+          } else {
+            scanMissCountRef.current += 1
+            if (scanMissCountRef.current % 8 === 0) {
+              setScanStatus('Point camera at barcode…')
+            }
+          }
+        } catch (e: any) {
+          if (!isExpectedDecodeMiss(e)) setScanStatus('Adjust distance or lighting')
+          zxingReaderRef.current?.reader?.reset?.()
+        }
+      }, 90)
+      setScanStatus('Scanner ready — scan a product')
+    } catch (e: any) {
+      setScanError(e?.message || 'Camera error')
+      toast.error(e?.message || 'Camera error')
+      setShowScanner(false)
+      stopScanner()
+    } finally {
+      setIsScanStarting(false)
     }
-    setScanStatus(`Added to bill: ${match.name}`)
-    toast.success(`Added: ${match.name}`)
   }
 
   useEffect(() => {
-    processScannedCodeRef.current = processScannedCode
-  })
-
-  const decodeWithCanvas = async () => {
-    if (isDecodingRef.current) return
-    isDecodingRef.current = true
-    try {
-      const video = videoRef.current
-      const canvas = canvasRef.current
-      if (!video || !canvas || video.readyState < 2) return
-
-      const detectOnSurface = async (
-        surface: NonNullable<ReturnType<typeof drawVideoToDecodeCanvas>>,
-        opts: { allowQuagga: boolean; tryHarder: boolean }
-      ) => {
-        const { ctx, dw, dh } = surface
-
-        const registerDetectedValue = async (value: string) => {
-          const normalized = normalizeBarcode(value)
-          if (!normalized) return false
-          // Accept first valid hit; duplicate suppression is already handled in processScannedCode.
-          cameraCandidateRef.current = { code: '', count: 0 }
-          scanMissCountRef.current = 0
-          await processScannedCodeRef.current(String(value).trim())
-          return true
-        }
-
-        if ('BarcodeDetector' in window) {
-          try {
-            if (!detectorRef.current) {
-              detectorRef.current = new (window as any).BarcodeDetector({
-                formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'codabar'],
-              })
-            }
-            // Detect directly from video first; this is often more reliable on desktop browsers.
-            const videoResults = await detectorRef.current.detect(video)
-            const videoValue = videoResults?.[0]?.rawValue
-            if (videoValue && (await registerDetectedValue(String(videoValue)))) {
-              return true
-            }
-
-            const results = await detectorRef.current.detect(canvas)
-            if (results?.[0]?.rawValue) {
-              if (await registerDetectedValue(String(results[0].rawValue))) return true
-            }
-          } catch {
-            // Fallback to ZXing below.
-          }
-        }
-
-        try {
-          const image = ctx.getImageData(0, 0, dw, dh)
-          if (!zxingReaderRef.current) {
-            zxingReaderRef.current = new MultiFormatReader()
-          }
-          const hints = new Map()
-          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-            BarcodeFormat.EAN_13,
-            BarcodeFormat.EAN_8,
-            BarcodeFormat.UPC_A,
-            BarcodeFormat.UPC_E,
-            BarcodeFormat.CODE_128,
-            BarcodeFormat.CODE_39,
-            BarcodeFormat.ITF,
-            BarcodeFormat.CODABAR,
-          ])
-          if (opts.tryHarder) {
-            hints.set(DecodeHintType.TRY_HARDER, true)
-          }
-          zxingReaderRef.current.setHints(hints)
-          const luminance = new RGBLuminanceSource(image.data, dw, dh)
-          const binary = new BinaryBitmap(new HybridBinarizer(luminance))
-          const result = zxingReaderRef.current.decode(binary)
-          if (result?.getText()) {
-            if (await registerDetectedValue(result.getText())) return true
-          }
-        } catch {
-          try {
-            zxingReaderRef.current?.reset?.()
-          } catch {
-            /* noop */
-          }
-          // ZXing miss — optional Quagga below (final pass only; throttled).
-        }
-
-        if (!opts.allowQuagga) return false
-
-        const now = Date.now()
-        if (now - lastQuaggaAttemptRef.current < 320) return false
-        lastQuaggaAttemptRef.current = now
-        const qText = await decodeQuaggaFromCanvas(canvas, { maxSide: 720, timeoutMs: 420 })
-        if (qText) {
-          if (await registerDetectedValue(qText)) return true
-        }
-        return false
-      }
-
-      const surface1 = drawVideoToDecodeCanvas(video, canvas, 'grayscale(1) contrast(1.35) brightness(1.1)')
-      if (!surface1) return
-      if (await detectOnSurface(surface1, { allowQuagga: false, tryHarder: false })) return
-
-      const surface2 = drawVideoToDecodeCanvas(video, canvas, 'grayscale(1) contrast(1.9) brightness(1.4)')
-      if (!surface2) return
-      if (await detectOnSurface(surface2, { allowQuagga: true, tryHarder: true })) return
-
-      // Final fallback: unfiltered frame can decode better on certain labels/displays.
-      const surface3 = drawVideoToDecodeCanvas(video, canvas, 'none')
-      if (!surface3) return
-      if (await detectOnSurface(surface3, { allowQuagga: true, tryHarder: true })) return
-
-      cameraCandidateRef.current = { code: '', count: 0 }
-      scanMissCountRef.current += 1
-      if (scanMissCountRef.current % 18 === 0) {
-        setScanStatus('No barcode detected yet. Keep barcode centered and move 10-15 cm away.')
-      }
-    } finally {
-      isDecodingRef.current = false
-    }
-  }
-
-  const applyCameraEnhancements = async (stream: MediaStream) => {
-    const track = stream.getVideoTracks()[0]
-    if (!track || !track.applyConstraints) return
-    const capabilities = (track.getCapabilities?.() || {}) as any
-    const advanced: any[] = []
-
-    if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes('continuous')) {
-      advanced.push({ focusMode: 'continuous' })
-    }
-    if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes('continuous')) {
-      advanced.push({ exposureMode: 'continuous' })
-    }
-    if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes('continuous')) {
-      advanced.push({ whiteBalanceMode: 'continuous' })
-    }
-    if (typeof capabilities.zoom?.max === 'number' && capabilities.zoom.max > 1) {
-      const zoomValue = Math.min(capabilities.zoom.max, Math.max(capabilities.zoom.min || 1, 1.2))
-      advanced.push({ zoom: zoomValue })
-    }
-    if (advanced.length) {
-      await track.applyConstraints({ advanced }).catch(() => {})
-    }
-
-    setTorchSupported(!!capabilities.torch)
-  }
-
-  const toggleTorch = async () => {
-    const track = streamRef.current?.getVideoTracks?.()[0]
-    if (!track?.applyConstraints) return
-    const next = !torchEnabled
-    try {
-      await track.applyConstraints({ advanced: [{ torch: next }] as any }).catch(() => {})
-      setTorchEnabled(next)
-    } catch {
-      toast.error('Torch is not supported on this device')
-    }
-  }
-
-  const startScanner = async (preferredDeviceId = '') => {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setScanStatus('Camera is not available in this browser.')
-      return
-    }
-
-    setScanStatus('Opening camera...')
-    setIsScannerStarting(true)
-    setShowScanner(true)
-    const rearList = await refreshRearVideoInputs()
-
-    try {
-      const preferredRearId = preferredDeviceId || selectedRearDeviceId || rearList[0]?.id || ''
-      const options: MediaStreamConstraints[] = [
-        ...(preferredRearId
-          ? [{
-              audio: false,
-              video: {
-                deviceId: { exact: preferredRearId },
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-                frameRate: { ideal: 30, max: 60 },
-              },
-            }]
-          : []),
-        {
-          audio: false,
-          video: {
-            facingMode: { exact: 'environment' },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-            frameRate: { ideal: 30, max: 60 },
-          },
-        },
-        {
-          audio: false,
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 24, max: 30 },
-          },
-        },
-        { audio: false, video: true },
-      ]
-
-      let stream: MediaStream | null = null
-      for (const constraints of options) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(constraints)
-          break
-        } catch {
-          // Continue through fallbacks
-        }
-      }
-      if (!stream) throw new Error('Unable to access camera')
-      streamRef.current = stream
-      await applyCameraEnhancements(stream)
-      if (videoRef.current) {
-        const video = videoRef.current
-        video.srcObject = stream
-        await video.play().catch(() => {})
-        await new Promise<void>((resolve) => {
-          let settled = false
-          const finish = () => {
-            if (settled) return
-            settled = true
-            resolve()
-          }
-          const timeout = window.setTimeout(finish, 1200)
-          const clear = () => {
-            window.clearTimeout(timeout)
-            finish()
-          }
-          const video = videoRef.current
-          if (!video) {
-            clear()
-            return
-          }
-          if (video.readyState >= 2) {
-            clear()
-            return
-          }
-          const onReady = () => {
-            video.removeEventListener('loadeddata', onReady)
-            clear()
-          }
-          video.addEventListener('loadeddata', onReady, { once: true })
-        })
-      }
-
-      const tick = () => {
-        scanRafRef.current = requestAnimationFrame(tick)
-        const now = Date.now()
-        if (now - lastDecodeAtRef.current < 90) return
-        lastDecodeAtRef.current = now
-        decodeWithCanvas().catch(() => {})
-      }
-      scanMissCountRef.current = 0
-      lastDecodeAtRef.current = 0
-      cameraCandidateRef.current = { code: '', count: 0 }
-      scanRafRef.current = requestAnimationFrame(tick)
-      setScanStatus('Scanner ready. Scan item to add directly.')
-    } catch (error: any) {
-      setScanStatus(error?.message || 'Unable to open camera')
-      toast.error(error?.message || 'Unable to open camera')
-      closeScanner()
-    } finally {
-      setIsScannerStarting(false)
-    }
-  }
-
-  const updateCartQty = async (id: string, nextQty: number) => {
-    const current = cartRef.current.find((entry) => entry.id === id)
-    if (!current) return
-    const normalizedNext = Math.max(0, Math.floor(nextQty))
-    if (normalizedNext === current.quantity) return
-
-    const delta = normalizedNext - current.quantity
-    if (delta > 0) {
-      const ok = await changeInventoryQty(id, -delta)
-      if (!ok) {
-        toast.error('Not enough stock in inventory')
+    const onKey = async (event: KeyboardEvent) => {
+      if (event.key === 'F8') {
+        event.preventDefault()
+        if (!storeToken) return
+        setShowScanner(true)
+        setTimeout(() => void startScanner(), 0)
         return
       }
-    } else if (delta < 0) {
-      await changeInventoryQty(id, Math.abs(delta))
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        manualEntryRef.current?.focus()
+        manualEntryRef.current?.select()
+        return
+      }
+      const target = event.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        const buffered = scannerBufferRef.current.trim()
+        scannerBufferRef.current = ''
+        if (scannerBufferTimerRef.current) {
+          clearTimeout(scannerBufferTimerRef.current)
+          scannerBufferTimerRef.current = null
+        }
+        if (buffered.length >= 6) await processScanRef.current?.(buffered, 'external-scanner')
+        return
+      }
+      if (event.key.length === 1) {
+        scannerBufferRef.current += event.key
+        if (scannerBufferTimerRef.current) clearTimeout(scannerBufferTimerRef.current)
+        scannerBufferTimerRef.current = setTimeout(() => {
+          scannerBufferRef.current = ''
+        }, 120)
+      }
     }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      if (scannerBufferTimerRef.current) clearTimeout(scannerBufferTimerRef.current)
+    }
+  }, [storeToken])
 
-    if (normalizedNext <= 0) {
-      setCart((prev) => prev.filter((entry) => entry.id !== id))
-      return
+  useEffect(() => () => stopScanner(), [])
+
+  const updateLineQty = async (lineId: string, nextQty: number) => {
+    const line = cartRef.current.find((l) => l.id === lineId)
+    if (!line) return
+    const q = Math.max(0, Math.floor(nextQty))
+    const delta = q - line.quantity
+    if (delta === 0) return
+    const cat = catalogRef.current.find((c) => c.id === lineId)
+    if (!cat) return
+    try {
+      if (delta > 0) {
+        if (cat.quantity < delta) {
+          toast.error('Not enough stock')
+          return
+        }
+        await itemsAPI.updateStock(lineId, {
+          quantity: delta,
+          type: 'STOCK_OUT',
+          reason: 'Billing counter',
+        })
+      } else {
+        await itemsAPI.updateStock(lineId, {
+          quantity: Math.abs(delta),
+          type: 'STOCK_IN',
+          reason: 'Billing line adjust',
+        })
+      }
+      setCatalog((prev) =>
+        prev.map((p) =>
+          p.id === lineId ? { ...p, quantity: Math.max(0, p.quantity - delta) } : p
+        )
+      )
+      if (q <= 0) setCart((prev) => prev.filter((l) => l.id !== lineId))
+      else setCart((prev) => prev.map((l) => (l.id === lineId ? { ...l, quantity: q } : l)))
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Stock update failed')
     }
-    setCart((prev) => prev.map((entry) => (entry.id === id ? { ...entry, quantity: normalizedNext } : entry)))
   }
 
   const clearBill = async () => {
-    const currentCart = cartRef.current
-    if (!currentCart.length) return
-    for (const entry of currentCart) {
-      await changeInventoryQty(entry.id, entry.quantity)
+    const lines = cartRef.current
+    if (!lines.length) return
+    for (const line of lines) {
+      try {
+        await itemsAPI.updateStock(line.id, {
+          quantity: line.quantity,
+          type: 'STOCK_IN',
+          reason: 'Bill cleared',
+        })
+      } catch {
+        /* still clear UI */
+      }
     }
+    await loadCatalog()
     setCart([])
-    if (typeof window !== 'undefined') localStorage.removeItem(CART_CACHE_KEY)
+    localStorage.removeItem(BILL_CACHE_KEY)
+    toast.success('Bill cleared')
+  }
+
+  const completeSale = async () => {
+    if (!cart.length) {
+      toast.error('Bill is empty')
+      return
+    }
+    setIsCheckoutLoading(true)
+    try {
+      const orderData = {
+        orderItems: cart.map((line) => ({
+          itemId: line.id,
+          quantity: line.quantity,
+          discount: 0,
+        })),
+        paymentMethod,
+        discount: 0,
+        stockReserved: true,
+      }
+      const response = await ordersAPI.createOrder(orderData as any)
+      toast.success('Sale completed')
+      setCart([])
+      localStorage.removeItem(BILL_CACHE_KEY)
+      await loadCatalog()
+      const orderId = response.data?.data?.order?.id
+      if (orderId) window.open(`/invoice/${orderId}`, '_blank')
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Checkout failed')
+    } finally {
+      setIsCheckoutLoading(false)
+    }
   }
 
   const printBill = () => {
-    if (cart.length === 0) {
-      toast.error('Cart is empty')
+    if (!cart.length) {
+      toast.error('Bill is empty')
       return
     }
     setIsPrinting(true)
-
     const rows = cart
-      .map((entry) => {
-        const lineTotal = Number(entry.price) * Number(entry.quantity)
-        return `
-          <tr>
-            <td style="border:1px solid #ddd;padding:6px;">${entry.name}</td>
-            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${entry.quantity}</td>
-            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${Number(entry.price).toFixed(2)}</td>
-            <td style="border:1px solid #ddd;padding:6px;text-align:right;">${lineTotal.toFixed(2)}</td>
-          </tr>
-        `
+      .map((line) => {
+        const t = line.price * line.quantity
+        return `<tr><td style="border:1px solid #ddd;padding:6px;">${line.name}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.quantity}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.price.toFixed(2)}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${t.toFixed(2)}</td></tr>`
       })
       .join('')
-
-    const html = `
-      <html>
-      <head><title>Billing Receipt</title></head>
-      <body style="font-family:Arial,sans-serif;padding:16px;">
-        <h2 style="margin:0 0 8px;">Billing Receipt</h2>
-        <div style="margin-bottom:12px;">Date: ${new Date().toLocaleString()}</div>
-        <table style="width:100%;border-collapse:collapse;">
-          <thead>
-            <tr>
-              <th style="border:1px solid #ddd;padding:6px;text-align:left;">Item</th>
-              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Qty</th>
-              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Price</th>
-              <th style="border:1px solid #ddd;padding:6px;text-align:right;">Total</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-        <h3 style="text-align:right;margin-top:12px;">Grand Total: Rs ${cartTotal.toFixed(2)}</h3>
-      </body>
-      </html>
-    `
-
-    const popup = window.open('', '_blank', 'width=900,height=700')
-    if (popup) {
-      popup.document.write(html)
-      popup.document.close()
-      popup.onload = () => {
-        popup.focus()
-        popup.print()
+    const html = `<html><head><title>Bill</title></head><body style="font-family:Arial,sans-serif;padding:16px;"><h2>Bill</h2><p>${new Date().toLocaleString()}</p><table style="width:100%;border-collapse:collapse;"><thead><tr><th style="border:1px solid #ddd;padding:6px;">Item</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Qty</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Price</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Total</th></tr></thead><tbody>${rows}</tbody></table><h3 style="text-align:right;">Total: Rs ${cartTotal.toFixed(2)}</h3></body></html>`
+    const w = window.open('', '_blank', 'width=900,height=700')
+    if (w) {
+      w.document.write(html)
+      w.document.close()
+      w.onload = () => {
+        w.print()
         setIsPrinting(false)
       }
-      return
-    }
-
-    const iframe = document.createElement('iframe')
-    iframe.style.position = 'fixed'
-    iframe.style.right = '0'
-    iframe.style.bottom = '0'
-    iframe.style.width = '0'
-    iframe.style.height = '0'
-    iframe.style.border = '0'
-    document.body.appendChild(iframe)
-    const frameDoc = iframe.contentDocument || iframe.contentWindow?.document
-    if (!frameDoc) {
-      document.body.removeChild(iframe)
-      toast.error('Could not initialize print view')
-      setIsPrinting(false)
-      return
-    }
-    frameDoc.open()
-    frameDoc.write(html)
-    frameDoc.close()
-    setTimeout(() => {
-      iframe.contentWindow?.focus()
-      iframe.contentWindow?.print()
-      setIsPrinting(false)
-      setTimeout(() => {
-        if (document.body.contains(iframe)) document.body.removeChild(iframe)
-      }, 600)
-    }, 100)
+    } else setIsPrinting(false)
   }
 
   if (authLoading) {
-    return <div className="min-h-screen grid place-items-center text-gray-600">Checking login...</div>
+    return <div className="min-h-screen grid place-items-center text-gray-600">Checking login…</div>
+  }
+
+  if (!storeToken) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-slate-100 to-slate-200">
+        <AppHeader active="billing" userEmail={currentUserEmail || undefined} />
+        <main className="max-w-md mx-auto p-6 mt-8">
+          <section className="bg-white rounded-xl shadow border border-slate-200 p-6 space-y-4">
+            <h1 className="text-xl font-semibold">Store billing (counter)</h1>
+            <p className="text-sm text-gray-600">
+              Products and stock are loaded from your <strong>store database</strong> (same as POS). Sign in with the
+              staff account you use for the POS server so scanning matches shelf barcodes.
+            </p>
+            <form onSubmit={handleStaffLogin} className="space-y-3">
+              <input
+                className="input w-full"
+                type="email"
+                autoComplete="username"
+                placeholder="Staff email"
+                value={staffEmail}
+                onChange={(e) => setStaffEmail(e.target.value)}
+              />
+              <input
+                className="input w-full"
+                type="password"
+                autoComplete="current-password"
+                placeholder="Password"
+                value={staffPassword}
+                onChange={(e) => setStaffPassword(e.target.value)}
+              />
+              <button type="submit" className="btn btn-primary w-full" disabled={loginSubmitting}>
+                {loginSubmitting ? 'Signing in…' : 'Connect store & open billing'}
+              </button>
+            </form>
+            <p className="text-xs text-gray-500">
+              After this, use <span className="font-medium">Scan to bill</span> or a USB barcode scanner. Manage full catalog in{' '}
+              <a className="text-blue-600 underline" href="/pos">
+                POS
+              </a>
+              .
+            </p>
+          </section>
+        </main>
+      </div>
+    )
   }
 
   return (
@@ -866,11 +752,22 @@ export default function BillingPage() {
       <AppHeader active="billing" userEmail={currentUserEmail || undefined} />
 
       <main className="max-w-6xl mx-auto p-4 space-y-4">
-        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
-          <h1 className="text-xl font-semibold">Billing Counter</h1>
-          <p className="text-sm text-gray-600 mt-1">
-            Billing view only shows items that you add to the bill. Inventory list is hidden here.
-          </p>
+        <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h1 className="text-xl font-semibold">Billing counter</h1>
+            <p className="text-sm text-gray-600 mt-1">
+              {loadingCatalog ? 'Loading catalog…' : `${catalog.length} products`}
+              {isOffline && <span className="text-amber-600 ml-2">(offline cache)</span>}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="btn btn-outline btn-sm" onClick={() => void loadCatalog()} disabled={loadingCatalog}>
+              Refresh catalog
+            </button>
+            <a href="/pos" className="btn btn-ghost btn-sm">
+              Open POS
+            </a>
+          </div>
         </section>
 
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
@@ -878,7 +775,7 @@ export default function BillingPage() {
             <input
               ref={manualEntryRef}
               className="input flex-1 min-w-[220px]"
-              placeholder="Enter barcode or item nameee"
+              placeholder="Scan or type barcode / product name"
               value={manualEntry}
               onChange={(e) => setManualEntry(e.target.value)}
               onKeyDown={(e) => {
@@ -889,53 +786,68 @@ export default function BillingPage() {
               }}
             />
             <button
+              type="button"
               className="btn btn-primary"
               onClick={() => {
                 void addToBillByQuery(manualEntry)
                 setManualEntry('')
               }}
-              disabled={loading}
+              disabled={loadingCatalog}
             >
-              Add To Bill
+              Add to bill
             </button>
-            <button className="btn btn-secondary min-w-32" onClick={() => void startScanner()} disabled={isScannerStarting}>
-              {isScannerStarting ? 'Opening...' : 'Scan To Bill'}
-            </button>
-            <button className="btn btn-outline min-w-40" onClick={loadItems} disabled={isRefreshingInventory}>
-              {isRefreshingInventory ? 'Refreshing...' : 'Refresh Inventory Source'}
+            <button
+              type="button"
+              className="btn btn-secondary min-w-32"
+              onClick={() => {
+                setShowScanner(true)
+                setTimeout(() => void startScanner(), 0)
+              }}
+              disabled={isScanStarting}
+            >
+              {isScanStarting ? 'Opening…' : 'Scan to bill'}
             </button>
           </div>
-          <div className="text-xs text-gray-600">
-            {loading ? 'Loading inventory source...' : `${items.length} inventory items available for lookup`}
-          </div>
+          <p className="text-xs text-gray-500">USB scanner: scan barcode then Enter. Camera: F8 or Scan to bill.</p>
         </section>
 
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-lg font-semibold">Current Bill</h2>
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h2 className="text-lg font-semibold">Current bill</h2>
             <div className="text-lg font-semibold">Rs {cartTotal.toFixed(2)}</div>
           </div>
-
+          <div className="mb-3 flex flex-wrap gap-2">
+            {(['CASH', 'UPI', 'CARD', 'CREDIT'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                className={`btn btn-sm ${paymentMethod === m ? 'btn-primary' : 'btn-outline'}`}
+                onClick={() => setPaymentMethod(m)}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
           {cart.length === 0 ? (
-            <div className="text-sm text-gray-600">No items in bill yet.</div>
+            <p className="text-sm text-gray-600">No lines yet — scan products to add.</p>
           ) : (
             <div className="space-y-2">
-              {cart.map((entry) => (
-                <div key={entry.id} className="border rounded p-2 flex items-center justify-between gap-2">
+              {cart.map((line) => (
+                <div key={line.id} className="border rounded p-2 flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="font-medium">{entry.name}</div>
-                    <div className="text-xs text-gray-600">{entry.barcode}</div>
+                    <div className="font-medium">{line.name}</div>
+                    <div className="text-xs text-gray-600">{line.barcode || '—'}</div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button className="btn btn-secondary btn-sm" onClick={() => updateCartQty(entry.id, entry.quantity - 1)}>
-                      -
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => void updateLineQty(line.id, line.quantity - 1)}>
+                      −
                     </button>
-                    <span className="w-8 text-center text-sm">{entry.quantity}</span>
-                    <button className="btn btn-secondary btn-sm" onClick={() => updateCartQty(entry.id, entry.quantity + 1)}>
+                    <span className="w-8 text-center text-sm">{line.quantity}</span>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => void updateLineQty(line.id, line.quantity + 1)}>
                       +
                     </button>
-                    <span className="w-24 text-right text-sm">Rs {(entry.price * entry.quantity).toFixed(2)}</span>
-                    <button className="btn btn-destructive btn-sm" onClick={() => updateCartQty(entry.id, 0)}>
+                    <span className="w-24 text-right text-sm">Rs {(line.price * line.quantity).toFixed(2)}</span>
+                    <button type="button" className="btn btn-destructive btn-sm" onClick={() => void updateLineQty(line.id, 0)}>
                       Remove
                     </button>
                   </div>
@@ -943,19 +855,15 @@ export default function BillingPage() {
               ))}
             </div>
           )}
-
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              className="btn btn-secondary"
-              onClick={() => {
-                void clearBill()
-              }}
-              disabled={cart.length === 0}
-            >
-              Clear Bill
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button type="button" className="btn btn-secondary" onClick={() => void clearBill()} disabled={!cart.length}>
+              Clear bill
             </button>
-            <button className="btn btn-primary min-w-32" onClick={printBill} disabled={cart.length === 0 || isPrinting}>
-              {isPrinting ? 'Printing...' : 'Print Bill'}
+            <button type="button" className="btn btn-outline" onClick={printBill} disabled={!cart.length || isPrinting}>
+              {isPrinting ? 'Printing…' : 'Print bill'}
+            </button>
+            <button type="button" className="btn btn-primary min-w-40" onClick={() => void completeSale()} disabled={!cart.length || isCheckoutLoading}>
+              {isCheckoutLoading ? 'Completing…' : 'Complete sale'}
             </button>
           </div>
         </section>
@@ -965,56 +873,71 @@ export default function BillingPage() {
         <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-3">
           <div className="bg-white rounded-xl w-full max-w-xl p-4 space-y-3 border border-slate-200">
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">Scan Barcode (Billing)</h3>
-              <button className="btn btn-ghost btn-sm" onClick={closeScanner}>
+              <h3 className="text-lg font-semibold">Scan product</h3>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => {
+                  setShowScanner(false)
+                  stopScanner()
+                }}
+              >
                 Close
               </button>
             </div>
-            {rearVideoInputs.length > 0 && (
-              <select
-                className="input"
-                value={selectedRearDeviceId}
-                onChange={(e) => {
-                  const nextId = e.target.value
-                  setSelectedRearDeviceId(nextId)
-                  if (!showScanner) return
-                  stopScanner()
-                  setScanStatus('Switching camera...')
-                  void startScanner(nextId)
-                }}
-              >
-                {rearVideoInputs.map((cam) => (
-                  <option key={cam.id} value={cam.id}>
-                    {cam.label}
-                  </option>
-                ))}
-              </select>
+            {rearVideoInputs.length > 1 && (
+              <div className="flex gap-2 flex-wrap">
+                <select
+                  className="input flex-1"
+                  value={selectedRearDeviceId}
+                  onChange={(e) => {
+                    setSelectedRearDeviceId(e.target.value)
+                    stopScanner()
+                    setTimeout(() => void startScanner(), 80)
+                  }}
+                >
+                  {rearVideoInputs.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  onClick={() => {
+                    const next = preferredFacingMode === 'environment' ? 'user' : 'environment'
+                    setPreferredFacingMode(next)
+                    stopScanner()
+                    setTimeout(() => void startScanner(next), 80)
+                  }}
+                >
+                  {preferredFacingMode === 'environment' ? 'Front camera' : 'Back camera'}
+                </button>
+              </div>
             )}
             <video ref={videoRef} className="w-full rounded bg-black max-h-[60vh]" autoPlay playsInline muted />
             <canvas ref={canvasRef} className="hidden" />
-            {torchSupported ? (
-              <button className="btn btn-outline btn-sm" onClick={toggleTorch}>
-                {torchEnabled ? 'Torch Off' : 'Torch On'}
-              </button>
-            ) : null}
-            <div className="text-sm text-gray-700">{scanStatus || 'Scan item to add directly to bill'}</div>
+            <p className="text-sm text-gray-700">{scanStatus}</p>
+            {scanError ? <p className="text-sm text-red-600">{scanError}</p> : null}
             <div className="flex gap-2">
               <input
                 className="input flex-1"
-                placeholder="Manual barcode entry"
+                placeholder="Manual barcode"
                 value={manualScanCode}
                 onChange={(e) => setManualScanCode(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    void processScannedCodeRef.current(manualScanCode)
+                    void processScannedCode(manualScanCode, 'manual')
                     setManualScanCode('')
                   }
                 }}
               />
               <button
+                type="button"
                 className="btn btn-primary"
                 onClick={() => {
-                  void processScannedCodeRef.current(manualScanCode)
+                  void processScannedCode(manualScanCode, 'manual')
                   setManualScanCode('')
                 }}
               >

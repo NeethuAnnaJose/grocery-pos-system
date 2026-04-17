@@ -19,6 +19,9 @@ export const AppHeader = ({ active, userEmail }: AppHeaderProps) => {
       } else if (typeof window !== 'undefined') {
         localStorage.removeItem('local_auth_session_v1')
       }
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('token')
+      }
       toast.success('Signed out')
       router.push('/login').catch(() => {})
     } catch (error: any) {
