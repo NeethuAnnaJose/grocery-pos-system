@@ -70,6 +70,34 @@ const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
   return false
 }
 
+/** Strip common GS1 / scanner prefixes so inventory EAN matches scanned payload. */
+const stripKnownScanPrefixes = (raw: string) => {
+  let s = normalizeBarcode(raw)
+  if (!s) return ''
+  // Numeric payload embedded in longer string (e.g. Code128 with extra chars)
+  const onlyDigits = digitsOnly(s)
+  if (onlyDigits.length >= 8 && onlyDigits.length <= 14 && /^\d+$/.test(onlyDigits)) {
+    return onlyDigits
+  }
+  return s
+}
+
+/** Always use latest inventory from ref (avoids stale closure in camera RAF loop). */
+const findInventoryItemByScan = (rawCode: string, list: InventoryItem[]): InventoryItem | null => {
+  const variants = new Set<string>()
+  for (const v of [rawCode, stripKnownScanPrefixes(rawCode), normalizeBarcode(rawCode)]) {
+    if (!v) continue
+    variants.add(v)
+    barcodeCandidates(v).forEach((c) => variants.add(c))
+  }
+  for (const candidate of Array.from(variants)) {
+    if (!candidate) continue
+    const hit = list.find((item) => itemMatchesBarcode(item, candidate))
+    if (hit) return hit
+  }
+  return null
+}
+
 export default function BillingPage() {
   const { authLoading, currentUserEmail } = useRequireAuth()
   const [items, setItems] = useState<InventoryItem[]>([])
@@ -106,6 +134,7 @@ export default function BillingPage() {
   const cameraCandidateRef = useRef<{ code: string; count: number }>({ code: '', count: 0 })
   const scannerBufferRef = useRef('')
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const processScannedCodeRef = useRef<(raw: string) => Promise<void>>(async () => {})
 
   const cartTotal = useMemo(
     () => cart.reduce((sum, entry) => sum + Number(entry.price || 0) * Number(entry.quantity || 0), 0),
@@ -238,7 +267,7 @@ export default function BillingPage() {
         }
         if (buffered.length >= 6) {
           event.preventDefault()
-          await processScannedCode(buffered)
+          await processScannedCodeRef.current(buffered)
         }
         return
       }
@@ -366,9 +395,11 @@ export default function BillingPage() {
 
     const normalized = normalizeBarcode(value)
     const quickHit = barcodeCandidates(normalized).map((candidate) => barcodeIndex.get(candidate)).find(Boolean)
-    if (quickHit) {
-      const success = await addToCart(quickHit, true)
-      if (success) toast.success(`Added: ${quickHit.name}`)
+    const fromRef = findInventoryItemByScan(value, inventoryRef.current.length ? inventoryRef.current : items)
+    const barcodeHit = quickHit || fromRef
+    if (barcodeHit) {
+      const success = await addToCart(barcodeHit, true)
+      if (success) toast.success(`Added: ${barcodeHit.name}`)
       return
     }
 
@@ -419,11 +450,7 @@ export default function BillingPage() {
       }
     }
 
-    const quickMatch =
-      barcodeCandidates(code)
-        .map((candidate) => barcodeIndex.get(candidate))
-        .find(Boolean) || null
-    const match = quickMatch || sourceItems.find((item) => itemMatchesBarcode(item, code))
+    const match = findInventoryItemByScan(rawCode, sourceItems)
     if (!match) {
       setScanStatus(`Not found: ${code}`)
       toast.error(`Item not found for ${code}. Tap "Refresh Inventory Source" once.`)
@@ -441,6 +468,10 @@ export default function BillingPage() {
     setScanStatus(`Added to bill: ${match.name}`)
     toast.success(`Added: ${match.name}`)
   }
+
+  useEffect(() => {
+    processScannedCodeRef.current = processScannedCode
+  })
 
   const decodeWithCanvas = async () => {
     if (isDecodingRef.current) return
@@ -462,7 +493,7 @@ export default function BillingPage() {
           // Accept first valid hit; duplicate suppression is already handled in processScannedCode.
           cameraCandidateRef.current = { code: '', count: 0 }
           scanMissCountRef.current = 0
-          await processScannedCode(normalized)
+          await processScannedCodeRef.current(String(value).trim())
           return true
         }
 
@@ -516,6 +547,11 @@ export default function BillingPage() {
             if (await registerDetectedValue(result.getText())) return true
           }
         } catch {
+          try {
+            zxingReaderRef.current?.reset?.()
+          } catch {
+            /* noop */
+          }
           // ZXing miss — optional Quagga below (final pass only; throttled).
         }
 
@@ -842,7 +878,7 @@ export default function BillingPage() {
             <input
               ref={manualEntryRef}
               className="input flex-1 min-w-[220px]"
-              placeholder="Enter barcode or item name"
+              placeholder="Enter barcode or item nameee"
               value={manualEntry}
               onChange={(e) => setManualEntry(e.target.value)}
               onKeyDown={(e) => {
@@ -970,7 +1006,7 @@ export default function BillingPage() {
                 onChange={(e) => setManualScanCode(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    void processScannedCode(manualScanCode)
+                    void processScannedCodeRef.current(manualScanCode)
                     setManualScanCode('')
                   }
                 }}
@@ -978,7 +1014,7 @@ export default function BillingPage() {
               <button
                 className="btn btn-primary"
                 onClick={() => {
-                  void processScannedCode(manualScanCode)
+                  void processScannedCodeRef.current(manualScanCode)
                   setManualScanCode('')
                 }}
               >
