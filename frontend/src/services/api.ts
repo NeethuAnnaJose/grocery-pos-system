@@ -1,7 +1,17 @@
 import axios from 'axios'
 import Router from 'next/router'
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || ''
+/** Public API origin only (no path), or empty to use same-origin /api (dev + Next rewrite). */
+function normalizeApiOrigin(raw: string | undefined): string {
+  const t = String(raw || '')
+    .trim()
+    .replace(/\/+$/, '')
+  if (!t) return ''
+  if (t.endsWith('/api')) return t.slice(0, -4).replace(/\/+$/, '')
+  return t
+}
+
+const API_BASE_URL = normalizeApiOrigin(process.env.NEXT_PUBLIC_API_URL)
 
 // Create axios instance
 const api = axios.create({

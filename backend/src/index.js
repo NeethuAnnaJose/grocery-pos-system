@@ -34,13 +34,22 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// CORS configuration (supports localhost + LAN access)
+// CORS: FRONTEND_URL and CORS_EXTRA_ORIGINS may be comma-separated lists (apex + www, staging + prod).
+function splitOrigins(value) {
+  if (!value || typeof value !== 'string') return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
+  ...splitOrigins(process.env.FRONTEND_URL),
+  ...splitOrigins(process.env.CORS_EXTRA_ORIGINS),
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'http://192.168.0.104:3000',
-].filter(Boolean);
+];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -51,8 +60,16 @@ app.use(cors({
     const isRenderOrigin =
       typeof origin === 'string' &&
       origin.endsWith('.onrender.com');
+    let isVercelPreview = false;
+    if (typeof origin === 'string' && process.env.CORS_ALLOW_VERCEL_PREVIEW === 'true') {
+      try {
+        isVercelPreview = new URL(origin).hostname.endsWith('.vercel.app');
+      } catch {
+        isVercelPreview = false;
+      }
+    }
 
-    if (!origin || allowedOrigins.includes(origin) || isTunnelOrigin || isRenderOrigin) {
+    if (!origin || allowedOrigins.includes(origin) || isTunnelOrigin || isRenderOrigin || isVercelPreview) {
       return callback(null, true);
     }
     return callback(new Error('Not allowed by CORS'));
