@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
 import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
+import { drawVideoToDecodeCanvas } from '@/lib/drawVideoToDecodeCanvas'
 import { decodeQuaggaFromCanvas } from '@/lib/quaggaFrameDecode'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
@@ -78,11 +79,12 @@ export default function InventoryPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const detectorRef = useRef<any | null>(null)
   const isDecodingRef = useRef(false)
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const scanRafRef = useRef<number | null>(null)
   const lastScannedRef = useRef('')
   const lastScanAtRef = useRef(0)
   const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
+  const itemsRef = useRef<InventoryItem[]>([])
 
   const filteredItems = useMemo(() => {
     const key = search.trim().toLowerCase()
@@ -135,10 +137,14 @@ export default function InventoryPage() {
     loadItems()
   }, [])
 
+  useEffect(() => {
+    itemsRef.current = items
+  }, [items])
+
   const stopScanner = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current)
-      intervalRef.current = null
+    if (scanRafRef.current !== null) {
+      cancelAnimationFrame(scanRafRef.current)
+      scanRafRef.current = null
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop())
@@ -196,12 +202,12 @@ export default function InventoryPage() {
     if (!code) return
 
     const now = Date.now()
-    if (lastScannedRef.current === code && now - lastScanAtRef.current < 1200) return
+    if (lastScannedRef.current === code && now - lastScanAtRef.current < 400) return
 
     lastScannedRef.current = code
     lastScanAtRef.current = now
 
-    const match = items.find((item) => itemMatchesBarcode(item, code))
+    const match = itemsRef.current.find((item) => itemMatchesBarcode(item, code))
     if (match) {
       setEditingId(match.id)
       setForm({
@@ -232,15 +238,12 @@ export default function InventoryPage() {
       const canvas = canvasRef.current
       if (!video || !canvas || video.readyState < 2) return
 
-      const width = Math.max(1, video.videoWidth || 1280)
-      const height = Math.max(1, video.videoHeight || 720)
-      canvas.width = width
-      canvas.height = height
+      const detectOnSurface = async (
+        surface: NonNullable<ReturnType<typeof drawVideoToDecodeCanvas>>,
+        opts: { allowQuagga: boolean; tryHarder: boolean }
+      ) => {
+        const { ctx, dw, dh } = surface
 
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })
-      if (!ctx) return
-
-      const detectFromCurrentCanvas = async (opts: { allowQuagga: boolean }) => {
         if ('BarcodeDetector' in window) {
           try {
             if (!detectorRef.current) {
@@ -259,22 +262,25 @@ export default function InventoryPage() {
         }
 
         try {
-          const image = ctx.getImageData(0, 0, width, height)
+          const image = ctx.getImageData(0, 0, dw, dh)
           if (!zxingReaderRef.current) {
-            const hints = new Map()
-            hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-              BarcodeFormat.EAN_13,
-              BarcodeFormat.EAN_8,
-              BarcodeFormat.UPC_A,
-              BarcodeFormat.UPC_E,
-              BarcodeFormat.CODE_128,
-              BarcodeFormat.CODE_39,
-              BarcodeFormat.ITF,
-            ])
             zxingReaderRef.current = new MultiFormatReader()
-            zxingReaderRef.current.setHints(hints)
           }
-          const luminance = new RGBLuminanceSource(image.data, width, height)
+          const hints = new Map()
+          hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.ITF,
+          ])
+          if (opts.tryHarder) {
+            hints.set(DecodeHintType.TRY_HARDER, true)
+          }
+          zxingReaderRef.current.setHints(hints)
+          const luminance = new RGBLuminanceSource(image.data, dw, dh)
           const binary = new BinaryBitmap(new HybridBinarizer(luminance))
           const result = zxingReaderRef.current.decode(binary)
           if (result?.getText()) {
@@ -282,15 +288,15 @@ export default function InventoryPage() {
             return true
           }
         } catch {
-          // ZXing miss — optional Quagga below (only on final pass; throttled).
+          // ZXing miss — optional Quagga below (final pass only; throttled).
         }
 
         if (!opts.allowQuagga) return false
 
         const now = Date.now()
-        if (now - lastQuaggaAttemptRef.current < 450) return false
+        if (now - lastQuaggaAttemptRef.current < 320) return false
         lastQuaggaAttemptRef.current = now
-        const qText = await decodeQuaggaFromCanvas(canvas)
+        const qText = await decodeQuaggaFromCanvas(canvas, { maxSide: 560, timeoutMs: 300 })
         if (qText) {
           processScannedCode(qText)
           return true
@@ -298,16 +304,13 @@ export default function InventoryPage() {
         return false
       }
 
-      // Pass 1: normal lighting (BarcodeDetector + ZXing only — fast path)
-      ctx.filter = 'grayscale(1) contrast(1.35) brightness(1.1)'
-      ctx.drawImage(video, 0, 0, width, height)
-      const firstPass = await detectFromCurrentCanvas({ allowQuagga: false })
-      if (firstPass) return
+      const surface1 = drawVideoToDecodeCanvas(video, canvas, 'grayscale(1) contrast(1.35) brightness(1.1)')
+      if (!surface1) return
+      if (await detectOnSurface(surface1, { allowQuagga: false, tryHarder: false })) return
 
-      // Pass 2: stronger contrast + throttled Quagga (expects URL/data URL, not ImageData)
-      ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.4)'
-      ctx.drawImage(video, 0, 0, width, height)
-      await detectFromCurrentCanvas({ allowQuagga: true })
+      const surface2 = drawVideoToDecodeCanvas(video, canvas, 'grayscale(1) contrast(1.9) brightness(1.4)')
+      if (!surface2) return
+      await detectOnSurface(surface2, { allowQuagga: true, tryHarder: true })
     } finally {
       isDecodingRef.current = false
     }
@@ -416,10 +419,11 @@ export default function InventoryPage() {
         await videoRef.current.play().catch(() => {})
       }
 
-      if (intervalRef.current) clearInterval(intervalRef.current)
-      intervalRef.current = setInterval(() => {
+      const tick = () => {
+        scanRafRef.current = requestAnimationFrame(tick)
         decodeWithCanvas().catch(() => {})
-      }, 90)
+      }
+      scanRafRef.current = requestAnimationFrame(tick)
       setScanStatus('Scanner is active')
     } catch (error: any) {
       setScanStatus(error?.message || 'Unable to open camera')

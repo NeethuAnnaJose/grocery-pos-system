@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "dev:http": "next dev -H 0.0.0.0 -p 3000",
+    "lan": "node scripts/show-lan.cjs",
     "dev:https": "next dev --experimental-https -H 0.0.0.0 -p 3000",
     "tunnel": "lt --port 3000 --local-host 127.0.0.1",
     "tunnel:fixed": "lt --port 3000 --local-host 127.0.0.1 --subdomain groceryposadmin",
