@@ -101,6 +101,8 @@ export default function BillingPage() {
   const lastScanAtRef = useRef(0)
   const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
+  const scanMissCountRef = useRef(0)
+  const lastDecodeAtRef = useRef(0)
   const scannerBufferRef = useRef('')
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -493,6 +495,7 @@ export default function BillingPage() {
           const binary = new BinaryBitmap(new HybridBinarizer(luminance))
           const result = zxingReaderRef.current.decode(binary)
           if (result?.getText()) {
+            scanMissCountRef.current = 0
             await processScannedCode(result.getText())
             return true
           }
@@ -507,6 +510,7 @@ export default function BillingPage() {
         lastQuaggaAttemptRef.current = now
         const qText = await decodeQuaggaFromCanvas(canvas, { maxSide: 560, timeoutMs: 300 })
         if (qText) {
+          scanMissCountRef.current = 0
           await processScannedCode(qText)
           return true
         }
@@ -519,7 +523,17 @@ export default function BillingPage() {
 
       const surface2 = drawVideoToDecodeCanvas(video, canvas, 'grayscale(1) contrast(1.9) brightness(1.4)')
       if (!surface2) return
-      await detectOnSurface(surface2, { allowQuagga: true, tryHarder: true })
+      if (await detectOnSurface(surface2, { allowQuagga: true, tryHarder: true })) return
+
+      // Final fallback: unfiltered frame can decode better on certain labels/displays.
+      const surface3 = drawVideoToDecodeCanvas(video, canvas, 'none')
+      if (!surface3) return
+      if (await detectOnSurface(surface3, { allowQuagga: true, tryHarder: true })) return
+
+      scanMissCountRef.current += 1
+      if (scanMissCountRef.current % 18 === 0) {
+        setScanStatus('No barcode detected yet. Keep barcode centered and move 10-15 cm away.')
+      }
     } finally {
       isDecodingRef.current = false
     }
@@ -623,13 +637,34 @@ export default function BillingPage() {
       await applyCameraEnhancements(stream)
       if (videoRef.current) {
         videoRef.current.srcObject = stream
+        await new Promise<void>((resolve) => {
+          const video = videoRef.current
+          if (!video) {
+            resolve()
+            return
+          }
+          if (video.readyState >= 2) {
+            resolve()
+            return
+          }
+          const onReady = () => {
+            video.removeEventListener('loadeddata', onReady)
+            resolve()
+          }
+          video.addEventListener('loadeddata', onReady, { once: true })
+        })
         await videoRef.current.play().catch(() => {})
       }
 
       const tick = () => {
         scanRafRef.current = requestAnimationFrame(tick)
+        const now = Date.now()
+        if (now - lastDecodeAtRef.current < 90) return
+        lastDecodeAtRef.current = now
         decodeWithCanvas().catch(() => {})
       }
+      scanMissCountRef.current = 0
+      lastDecodeAtRef.current = 0
       scanRafRef.current = requestAnimationFrame(tick)
       setScanStatus('Scanner ready. Scan item to add directly.')
     } catch (error: any) {
