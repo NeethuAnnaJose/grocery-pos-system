@@ -202,7 +202,14 @@ export default function BillingPage() {
       toast.success('Store connected. Catalog loading…')
       await loadCatalog()
     } catch (err: any) {
-      toast.error(err?.response?.data?.message || 'Store login failed')
+      const msg = err?.response?.data?.message
+      if (!err?.response) {
+        toast.error(
+          'Cannot reach store server. Start the backend (e.g. port 5000), set frontend .env NEXT_PUBLIC_API_URL to that URL, then try again.'
+        )
+      } else {
+        toast.error(msg || 'Store login failed')
+      }
     } finally {
       setLoginSubmitting(false)
     }
@@ -741,6 +748,22 @@ export default function BillingPage() {
               </a>
               .
             </p>
+            <div className="text-xs text-gray-600 border-t border-slate-100 pt-3 space-y-1">
+              <p className="font-medium text-gray-800">First-time setup</p>
+              <ol className="list-decimal list-inside space-y-1">
+                <li>
+                  In <code className="text-xs bg-slate-100 px-1 rounded">backend/</code>: copy <code className="text-xs bg-slate-100 px-1 rounded">.env.example</code> to{' '}
+                  <code className="text-xs bg-slate-100 px-1 rounded">.env</code>, run migrations, then{' '}
+                  <code className="text-xs bg-slate-100 px-1 rounded">npm run seed</code>.
+                </li>
+                <li>
+                  Default staff user from seed: <strong>staff@shop.com</strong> / <strong>staff123</strong>
+                </li>
+                <li>
+                  Or register a new staff user: POST <code className="text-xs bg-slate-100 px-1 rounded">/api/auth/register</code> (or use POS register if enabled).
+                </li>
+              </ol>
+            </div>
           </section>
         </main>
       </div>
