@@ -1,9 +1,11 @@
 /** @type {import('next').NextConfig} */
 const publicApiUrl = (process.env.NEXT_PUBLIC_API_URL || '').trim()
+// Do not throw here: Vercel/CI builds often run before env vars are added, which would block every deploy.
+// For a working live API, set NEXT_PUBLIC_API_URL in the host dashboard (e.g. Vercel → Settings → Environment Variables).
 if (process.env.NODE_ENV === 'production' && !publicApiUrl) {
-  throw new Error(
-    'Set NEXT_PUBLIC_API_URL for production (public API origin only, e.g. https://api.yourdomain.com). ' +
-      'Leaving it empty makes the app use /api on the same host, which cannot reach your backend on a live server.'
+  console.warn(
+    '[grocery-pos] NEXT_PUBLIC_API_URL is empty. Browser calls will use same-origin /api. ' +
+      'On Vercel, add NEXT_PUBLIC_API_URL = your API origin (e.g. https://your-backend.onrender.com), apply to Production, then redeploy.'
   )
 }
 
