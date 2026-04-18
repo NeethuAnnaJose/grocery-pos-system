@@ -71,14 +71,23 @@ router.get('/:barcode', auth, async (req, res) => {
 });
 
 // POST /api/product
+// Note: express-validator isFloat/isInt expect strings; JSON clients often send numbers — use custom checks.
 router.post(
   '/',
   [
     staffAuth,
     body('name').notEmpty().withMessage('Product name is required'),
     body('barcode').notEmpty().withMessage('Barcode is required'),
-    body('price').isFloat({ min: 0 }).withMessage('Price must be non-negative'),
-    body('quantity').optional().isInt({ min: 0 }).withMessage('Quantity must be non-negative'),
+    body('price').custom((value) => {
+      if (value === undefined || value === null || value === '') return false;
+      const n = typeof value === 'number' ? value : parseFloat(String(value).replace(/,/g, '.'));
+      return Number.isFinite(n) && n >= 0;
+    }).withMessage('Price must be a non-negative number'),
+    body('quantity').optional().custom((value) => {
+      if (value === undefined || value === null || value === '') return true;
+      const n = typeof value === 'number' ? value : parseInt(String(value), 10);
+      return Number.isInteger(n) && n >= 0;
+    }).withMessage('Quantity must be a non-negative integer'),
   ],
   async (req, res) => {
     try {
@@ -92,23 +101,33 @@ router.post(
       }
 
       const barcode = normalizeBarcode(req.body.barcode);
+      const candidates = barcodeCandidates(barcode);
       const existing = await prisma.item.findFirst({
-        where: { barcode, isActive: true },
-        select: { id: true },
+        where: {
+          isActive: true,
+          OR: candidates.map((c) => ({ barcode: c })),
+        },
+        include: { category: { select: { id: true, name: true } } },
       });
       if (existing) {
-        return res.status(400).json({ success: false, message: 'Barcode already exists' });
+        return res.status(409).json({
+          success: false,
+          message: 'Barcode already exists',
+          data: { product: existing },
+        });
       }
 
       const categoryId = req.body.categoryId || (await ensureDefaultCategory());
       const price = Number(req.body.price);
       const costPrice = req.body.costPrice !== undefined ? Number(req.body.costPrice) : price;
       const quantity = req.body.quantity !== undefined ? Number(req.body.quantity) : 0;
+      const sku = `SKU-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
       const product = await prisma.item.create({
         data: {
           name: String(req.body.name).trim(),
           barcode,
+          sku,
           categoryId,
           price,
           costPrice,

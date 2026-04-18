@@ -68,6 +68,8 @@ export default function POS() {
   const [selectedRearDeviceId, setSelectedRearDeviceId] = useState('')
   const [manualScanCode, setManualScanCode] = useState('')
   const [pendingScannedBarcode, setPendingScannedBarcode] = useState('')
+  /** After Create or duplicate-resolve: use "Add to cart" / "Add to list" without creating again. */
+  const [itemReadyForCart, setItemReadyForCart] = useState<Item | null>(null)
   const [newItemFromScan, setNewItemFromScan] = useState({
     name: '',
     price: '',
@@ -388,10 +390,10 @@ export default function POS() {
     }
   }
 
-  const handleAddToCart = async (item: Item) => {
+  const handleAddToCart = async (item: Item): Promise<boolean> => {
     if (item.quantity === 0) {
       toast.error('Item is out of stock')
-      return
+      return false
     }
 
     const cartItem = items.find(cartItem => cartItem.id === item.id)
@@ -399,7 +401,7 @@ export default function POS() {
 
     if (currentQuantity >= item.quantity) {
       toast.error('Insufficient stock')
-      return
+      return false
     }
 
     try {
@@ -422,6 +424,7 @@ export default function POS() {
           p.id === item.id ? { ...p, quantity: Math.max(0, p.quantity - 1) } : p
         )
       )
+      return true
     } catch (error: any) {
       if (!error?.response) {
         // Offline/network fallback: keep billing flow running, sync stock later.
@@ -438,9 +441,10 @@ export default function POS() {
           )
         )
         toast.success(`${item.name} added (offline mode)`)
-        return
+        return true
       }
       toast.error(error.response?.data?.message || 'Could not reserve stock')
+      return false
     }
   }
 
@@ -565,9 +569,13 @@ export default function POS() {
         playScanBeep('success')
         closeScannerModal()
         if (scanMode === 'CART') {
-          await handleAddToCart(matchedItem)
-          setScanStatus(`Product added to cart: ${matchedItem.name}`)
-          toast.success(`Added to cart: ${matchedItem.name}`)
+          const added = await handleAddToCart(matchedItem)
+          if (added) {
+            setScanStatus(`Product added to cart: ${matchedItem.name}`)
+            toast.success(`Added to cart: ${matchedItem.name}`)
+          } else {
+            setScanStatus('Not added — check stock or try again')
+          }
         } else {
           setScannedItemsList((prev) => {
             const next = [{ id: matchedItem.id, name: matchedItem.name, barcode: matchedItem.barcode, price: matchedItem.price, scannedAt: now }, ...prev]
@@ -581,6 +589,7 @@ export default function POS() {
       } else {
         playScanBeep('captured')
         closeScannerModal()
+        setItemReadyForCart(null)
         setSearchTerm(normalizedCode)
         setPendingScannedBarcode(normalizedCode)
         setScanStatus('New barcode captured. Add product details below.')
@@ -679,6 +688,17 @@ export default function POS() {
     }
   }
 
+  const readApiErrorMessage = (error: any, fallback: string) => {
+    const d = error?.response?.data
+    if (typeof d?.message === 'string' && d.message.trim()) return d.message.trim()
+    if (Array.isArray(d?.errors) && d.errors.length) {
+      const first = d.errors[0]
+      if (typeof first?.msg === 'string') return first.msg
+    }
+    return fallback
+  }
+
+  /** Saves a new inventory row only. Use "Add to cart" / "Add to list" next. */
   const handleCreateItemFromScan = async () => {
     const name = newItemFromScan.name.trim()
     const barcode = pendingScannedBarcode.trim()
@@ -720,11 +740,13 @@ export default function POS() {
 
       const createdItem = response.data?.data?.product
       if (createdItem) {
-        setAvailableItems((prev) => [createdItem, ...prev])
+        setAvailableItems((prev) => (prev.some((x) => x.id === createdItem.id) ? prev : [createdItem, ...prev]))
+        setItemReadyForCart(createdItem)
       } else {
         await fetchItems()
+        const resolved = await fetchProductByBarcode(barcode)
+        if (resolved) setItemReadyForCart(resolved)
       }
-      setPendingScannedBarcode('')
       setNewItemFromScan((prev) => ({
         ...prev,
         name: '',
@@ -732,23 +754,54 @@ export default function POS() {
         costPrice: '',
         quantity: '1',
       }))
-
-      if (createdItem && scanMode === 'CART') {
-        await handleAddToCart(createdItem)
-      }
-      if (createdItem && scanMode === 'LIST') {
-        setScannedItemsList((prev) => [
-          { id: createdItem.id, name: createdItem.name, barcode: createdItem.barcode, price: createdItem.price, scannedAt: Date.now() },
-          ...prev,
-        ])
-      }
-      toast.success(scanMode === 'CART' ? 'Item created and added to cart' : 'Item created and added to scanned list')
+      toast.success('Product saved to inventory. Use Add to cart or Add to list when ready.')
     } catch (error: any) {
-      const serverMessage =
-        error?.response?.data?.message ||
-        error?.response?.data?.errors?.[0]?.msg
-      toast.error(serverMessage || 'Failed to create item')
+      if (error?.response?.status === 409) {
+        const existing = error?.response?.data?.data?.product as Item | undefined
+        if (existing?.id) {
+          setAvailableItems((prev) =>
+            prev.some((x) => x.id === existing.id) ? prev.map((x) => (x.id === existing.id ? existing : x)) : [existing, ...prev]
+          )
+          setItemReadyForCart(existing)
+          toast.success('This barcode is already in inventory. Use Add to cart or Add to list.')
+          return
+        }
+      }
+      toast.error(readApiErrorMessage(error, 'Failed to create item'))
     }
+  }
+
+  /** Adds the resolved product (after Create or duplicate) to cart or scanned list — separate from Create. */
+  const handleAddResolvedScanToSale = async () => {
+    const code = pendingScannedBarcode.trim()
+    let item: Item | null = itemReadyForCart
+    if (!item && code) {
+      item = await fetchProductByBarcode(code)
+    }
+    if (!item) {
+      toast.error('Create the product first, or scan a barcode that exists in inventory.')
+      return
+    }
+    if (scanMode === 'CART') {
+      const ok = await handleAddToCart(item)
+      if (!ok) return
+      toast.success(`Added to cart: ${item.name}`)
+    } else {
+      const now = Date.now()
+      setScannedItemsList((prev) =>
+        [{ id: item!.id, name: item!.name, barcode: item!.barcode, price: item!.price, scannedAt: now }, ...prev].slice(0, 50)
+      )
+      toast.success(`Added to list: ${item.name}`)
+    }
+    setPendingScannedBarcode('')
+    setItemReadyForCart(null)
+    setNewItemFromScan((prev) => ({
+      ...prev,
+      name: '',
+      price: '',
+      costPrice: '',
+      quantity: '1',
+    }))
   }
 
   const scoreCameraLabel = (label: string) => {
@@ -1375,7 +1428,16 @@ export default function POS() {
 
           {pendingScannedBarcode && (
             <div className="bg-white rounded-lg shadow p-4">
-              <h3 className="font-medium mb-3">Add New Product from Scanned Barcode</h3>
+              <h3 className="font-medium mb-1">Barcode not in catalog</h3>
+              <p className="text-xs text-gray-600 mb-3">
+                <strong>Create</strong> saves the product to inventory only. <strong>Add to cart</strong> /{' '}
+                <strong>Add to list</strong> adds the saved (or existing) product to the current sale or list.
+              </p>
+              {itemReadyForCart && (
+                <p className="text-xs text-green-700 font-medium mb-2">
+                  Ready to add: {itemReadyForCart.name} (barcode {itemReadyForCart.barcode || pendingScannedBarcode})
+                </p>
+              )}
               <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
                 <input
                   type="text"
@@ -1436,12 +1498,23 @@ export default function POS() {
                   value={newItemFromScan.unit}
                   onChange={(e) => setNewItemFromScan((prev) => ({ ...prev, unit: e.target.value }))}
                 />
-                <button onClick={handleCreateItemFromScan} className="btn btn-primary">
-                  {scanMode === 'CART' ? 'Create + Add to Cart' : 'Create + Add to List'}
+                <button type="button" onClick={() => void handleCreateItemFromScan()} className="btn btn-secondary">
+                  Create product
                 </button>
                 <button
-                  onClick={() => setPendingScannedBarcode('')}
-                  className="btn btn-secondary"
+                  type="button"
+                  onClick={() => void handleAddResolvedScanToSale()}
+                  className="btn btn-primary"
+                >
+                  {scanMode === 'CART' ? 'Add to cart' : 'Add to scanned list'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingScannedBarcode('')
+                    setItemReadyForCart(null)
+                  }}
+                  className="btn btn-outline"
                 >
                   Cancel
                 </button>

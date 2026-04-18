@@ -86,7 +86,8 @@ router.post('/register', [
       });
     }
 
-    const { email, password, name, role = 'STAFF', phone } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { password, name, role = 'STAFF', phone } = req.body;
 
     // Check if user already exists
     const existingUser = await prisma.user.findUnique({
@@ -104,7 +105,7 @@ router.post('/register', [
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // Create user
+    // Create user (email normalized lowercase)
     const user = await prisma.user.create({
       data: {
         email,
@@ -161,9 +162,10 @@ router.post('/login', [
       });
     }
 
-    const { email, password } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { password } = req.body;
 
-    // Find user
+    // Find user (emails stored lowercase from seed/register)
     const user = await prisma.user.findUnique({
       where: { email }
     });

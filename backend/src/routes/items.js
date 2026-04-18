@@ -459,7 +459,11 @@ router.delete('/:id', [auth, async (req, res, next) => {
 // @access  Private (Staff+)
 router.post('/:id/stock', [
   staffAuth,
-  body('quantity').isInt({ min: 1 }).withMessage('Quantity must be positive'),
+  body('quantity').custom((value) => {
+    if (value === undefined || value === null || value === '') return false;
+    const n = typeof value === 'number' ? value : parseInt(String(value), 10);
+    return Number.isInteger(n) && n >= 1;
+  }).withMessage('Quantity must be a positive integer'),
   body('type').isIn(['STOCK_IN', 'STOCK_OUT']).withMessage('Invalid stock type'),
   body('reason').optional().notEmpty().withMessage('Reason cannot be empty'),
 ], async (req, res) => {

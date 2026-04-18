@@ -59,6 +59,16 @@ const itemMatchesBarcode = (item: CatalogItem, scannedValue: string) => {
 
 const getStoredToken = () => (typeof window !== 'undefined' ? localStorage.getItem('token') : '')
 
+const apiErrorMessage = (err: any, fallback: string) => {
+  const d = err?.response?.data
+  if (typeof d?.message === 'string' && d.message.trim()) return d.message.trim()
+  if (Array.isArray(d?.errors) && d.errors.length) {
+    const first = d.errors[0]
+    if (typeof first?.msg === 'string') return first.msg
+  }
+  return fallback
+}
+
 export default function BillingPage() {
   const { authLoading, currentUserEmail } = useRequireAuth()
   const [storeToken, setStoreToken] = useState('')
@@ -116,7 +126,21 @@ export default function BillingPage() {
   }, [catalog])
 
   useEffect(() => {
-    setStoreToken(getStoredToken() || '')
+    const t = getStoredToken()
+    if (!t) {
+      setStoreToken('')
+      return
+    }
+    setStoreToken(t)
+    authAPI
+      .getCurrentUser()
+      .catch((err: any) => {
+        if (err?.response?.status === 401) {
+          localStorage.removeItem('token')
+          setStoreToken('')
+          toast.error('Store session expired. Sign in again with your staff account.')
+        }
+      })
   }, [])
 
   useEffect(() => {
@@ -202,13 +226,17 @@ export default function BillingPage() {
       toast.success('Store connected. Catalog loading…')
       await loadCatalog()
     } catch (err: any) {
-      const msg = err?.response?.data?.message
+      const msg = apiErrorMessage(err, 'Store login failed')
       if (!err?.response) {
         toast.error(
           'Cannot reach store server. Start the backend (e.g. port 5000), set frontend .env NEXT_PUBLIC_API_URL to that URL, then try again.'
         )
       } else {
-        toast.error(msg || 'Store login failed')
+        const hint =
+          /invalid credentials/i.test(msg) || /invalid credential/i.test(msg)
+            ? ' Use the database staff password (after seed: staff@shop.com / staff123). This is not the same as the optional local counter login on /login.'
+            : ''
+        toast.error(`${msg}${hint}`)
       }
     } finally {
       setLoginSubmitting(false)
