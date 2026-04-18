@@ -1,23 +1,17 @@
 import axios from 'axios'
 import Router from 'next/router'
+import { getBrowserApiBaseURL, normalizeApiOrigin } from '@/lib/apiOrigin'
 
 /** Public API origin only (no path), or empty to use same-origin /api (dev + Next rewrite). */
-function normalizeApiOrigin(raw: string | undefined): string {
-  const t = String(raw || '')
-    .trim()
-    .replace(/\/+$/, '')
-  if (!t) return ''
-  if (t.endsWith('/api')) return t.slice(0, -4).replace(/\/+$/, '')
-  return t
-}
-
 const API_BASE_URL = normalizeApiOrigin(process.env.NEXT_PUBLIC_API_URL)
+
+const serverSideBaseURL = API_BASE_URL ? `${API_BASE_URL}/api` : '/api'
 
 // Create axios instance
 const api = axios.create({
-  // Use same-origin /api by default (works with Next rewrite + HTTPS tunnel)
-  baseURL: API_BASE_URL ? `${API_BASE_URL}/api` : '/api',
-  timeout: 10000,
+  // Client requests: baseURL updated per request (localStorage override). SSR: build-time env only.
+  baseURL: typeof window !== 'undefined' ? getBrowserApiBaseURL(API_BASE_URL) : serverSideBaseURL,
+  timeout: 20000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -36,9 +30,12 @@ const shouldRetryRequest = (error: any) => {
   return !alreadyRetried && (isRetriableStatus || isNetworkFailure)
 }
 
-// Request interceptor to add auth token
+// Request interceptor: API base (supports SHOPPOS_API_ORIGIN in browser) + auth token
 api.interceptors.request.use(
   (config) => {
+    if (typeof window !== 'undefined') {
+      config.baseURL = getBrowserApiBaseURL(API_BASE_URL)
+    }
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : ''
     if (token) {
       config.headers.Authorization = `Bearer ${token}`

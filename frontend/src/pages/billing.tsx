@@ -3,6 +3,7 @@ import toast from 'react-hot-toast'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
 import { authAPI, itemsAPI, ordersAPI, productAPI } from '@/services/api'
+import { getStoredApiOrigin, setStoredApiOrigin } from '@/lib/apiOrigin'
 
 /**
  * Mall-style billing counter: products live in the store DB (same API as POS).
@@ -75,6 +76,8 @@ export default function BillingPage() {
   const [staffEmail, setStaffEmail] = useState('')
   const [staffPassword, setStaffPassword] = useState('')
   const [loginSubmitting, setLoginSubmitting] = useState(false)
+  /** Saved to localStorage as SHOPPOS_API_ORIGIN so the browser can reach your API (Vercel / mobile). */
+  const [apiBackendDraft, setApiBackendDraft] = useState('')
 
   const [catalog, setCatalog] = useState<CatalogItem[]>([])
   const [cart, setCart] = useState<BillLine[]>([])
@@ -124,6 +127,12 @@ export default function BillingPage() {
   useEffect(() => {
     catalogRef.current = catalog
   }, [catalog])
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setApiBackendDraft(getStoredApiOrigin())
+    }
+  }, [])
 
   useEffect(() => {
     const t = getStoredToken()
@@ -213,6 +222,7 @@ export default function BillingPage() {
     }
     setLoginSubmitting(true)
     try {
+      setStoredApiOrigin(apiBackendDraft.trim())
       const response = await authAPI.login({ email, password: staffPassword })
       const body = response.data
       const token = body?.data?.token
@@ -749,6 +759,20 @@ export default function BillingPage() {
               staff account you use for the POS server so scanning matches shelf barcodes.
             </p>
             <form onSubmit={handleStaffLogin} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Backend API URL (if login fails on live / phone)</label>
+                <input
+                  className="input w-full text-sm"
+                  type="url"
+                  inputMode="url"
+                  placeholder="https://your-api.onrender.com"
+                  value={apiBackendDraft}
+                  onChange={(e) => setApiBackendDraft(e.target.value)}
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  No <code className="bg-slate-100 px-0.5 rounded">/api</code> suffix. Saved in this browser only. Clear the field and save with empty to reset.
+                </p>
+              </div>
               <input
                 className="input w-full"
                 type="email"

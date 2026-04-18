@@ -60,6 +60,7 @@ export default function POS() {
   const [isScanStarting, setIsScanStarting] = useState(false)
   const [isSoundReady, setIsSoundReady] = useState(false)
   const [isOffline, setIsOffline] = useState(false)
+  const [showApiConnectionHelp, setShowApiConnectionHelp] = useState(false)
   const [lastScannedCode, setLastScannedCode] = useState('')
   const [lastScannedItemId, setLastScannedItemId] = useState('')
   const [scannedItemsList, setScannedItemsList] = useState<ScannedListEntry[]>([])
@@ -192,6 +193,7 @@ export default function POS() {
       const response = await itemsAPI.getItems({ limit: 1000 })
       const itemsData = Array.isArray(response.data?.data?.items) ? response.data.data.items : []
       setAvailableItems(itemsData)
+      setShowApiConnectionHelp(false)
       if (typeof window !== 'undefined') {
         localStorage.setItem('cached_products', JSON.stringify(itemsData))
       }
@@ -208,8 +210,11 @@ export default function POS() {
           lastFetchErrorAtRef.current = Date.now()
         }
       } else {
+        if (!(error as any)?.response) {
+          setShowApiConnectionHelp(true)
+        }
         if (Date.now() - lastFetchErrorAtRef.current > 5000) {
-          toast.error('Failed to fetch items')
+          toast.error('Failed to fetch items — check API URL on Billing store login')
           lastFetchErrorAtRef.current = Date.now()
         }
         setAvailableItems([])
@@ -1348,6 +1353,15 @@ export default function POS() {
 
   return (
     <div className="min-h-screen bg-gray-100">
+      {showApiConnectionHelp && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-3 text-sm">
+          <strong>Cannot reach the store API.</strong> Open{' '}
+          <a href="/billing" className="underline font-medium">
+            Billing → store login
+          </a>{' '}
+          and set <em>Backend API URL</em> to your server (e.g. <code className="bg-amber-100 px-1 rounded">https://…onrender.com</code>), then sign in and return here. Reload this page after saving.
+        </div>
+      )}
       <div className="bg-white shadow-sm border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center py-4">

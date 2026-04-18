@@ -60,6 +60,15 @@ app.use(cors({
     const isRenderOrigin =
       typeof origin === 'string' &&
       origin.endsWith('.onrender.com');
+    let isVercelOrigin = false;
+    if (typeof origin === 'string') {
+      try {
+        const host = new URL(origin).hostname;
+        isVercelOrigin = host === 'vercel.app' || host.endsWith('.vercel.app');
+      } catch {
+        isVercelOrigin = false;
+      }
+    }
     let isVercelPreview = false;
     if (typeof origin === 'string' && process.env.CORS_ALLOW_VERCEL_PREVIEW === 'true') {
       try {
@@ -69,7 +78,7 @@ app.use(cors({
       }
     }
 
-    if (!origin || allowedOrigins.includes(origin) || isTunnelOrigin || isRenderOrigin || isVercelPreview) {
+    if (!origin || allowedOrigins.includes(origin) || isTunnelOrigin || isRenderOrigin || isVercelOrigin || isVercelPreview) {
       return callback(null, true);
     }
     return callback(new Error('Not allowed by CORS'));
@@ -85,12 +94,19 @@ app.use(express.urlencoded({ extended: true }));
 app.use(morgan('combined'));
 
 // Health check endpoint
+const healthPayload = () => ({
+  status: 'OK',
+  timestamp: new Date().toISOString(),
+  uptime: process.uptime(),
+});
+
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+  res.status(200).json(healthPayload());
+});
+
+// Same payload under /api so Next.js /api/* proxy checks work without extra routing.
+app.get('/api/health', (req, res) => {
+  res.status(200).json(healthPayload());
 });
 
 // API routes

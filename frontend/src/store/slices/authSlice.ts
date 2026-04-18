@@ -25,6 +25,17 @@ const initialState: AuthState = {
   isAuthenticated: false,
 }
 
+const readApiFailureMessage = (error: any, fallback: string) => {
+  if (!error?.response) {
+    if (error?.code === 'ECONNABORTED') return 'Request timed out. Check that the backend is running and reachable.'
+    return 'Cannot reach the API. Set Backend API URL on the Billing page (store login), or set NEXT_PUBLIC_API_URL when building, then reload.'
+  }
+  const d = error.response.data
+  if (typeof d?.message === 'string' && d.message.trim()) return d.message.trim()
+  if (Array.isArray(d?.errors) && d.errors.length && typeof d.errors[0]?.msg === 'string') return d.errors[0].msg
+  return fallback
+}
+
 // Async thunks
 export const login = createAsyncThunk(
   'auth/login',
@@ -38,7 +49,7 @@ export const login = createAsyncThunk(
       }
       return { user: body.data.user, token: body.data.token }
     } catch (error: any) {
-      return rejectWithValue(error.response?.data?.message || 'Login failed')
+      return rejectWithValue(readApiFailureMessage(error, 'Login failed'))
     }
   }
 )
@@ -60,7 +71,7 @@ export const register = createAsyncThunk(
       }
       return { user: body.data.user, token: body.data.token }
     } catch (error: any) {
-      return rejectWithValue(error.response?.data?.message || 'Registration failed')
+      return rejectWithValue(readApiFailureMessage(error, 'Registration failed'))
     }
   }
 )
