@@ -34,3 +34,31 @@ export function getBrowserApiBaseURL(envOrigin: string): string {
   const base = fromStorage || normalizeApiOrigin(envOrigin)
   return base ? `${base}/api` : '/api'
 }
+
+/** Tutorial / placeholder hosts — never use as a real API (login will always fail). */
+const BLOCKED_API_HOSTS = new Set(['your-api.onrender.com'])
+
+export function isBlockedExampleApiOrigin(raw: string): boolean {
+  const n = normalizeApiOrigin(raw)
+  if (!n) return false
+  let urlStr = n
+  if (!/^https?:\/\//i.test(urlStr)) urlStr = `https://${urlStr}`
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase()
+    if (BLOCKED_API_HOSTS.has(host)) return true
+    if (host === 'example.com' || host.endsWith('.example.com')) return true
+    return false
+  } catch {
+    return true
+  }
+}
+
+export function isVercelLiveSite(): boolean {
+  if (typeof window === 'undefined') return false
+  const h = window.location.hostname.toLowerCase()
+  return h === 'vercel.app' || h.endsWith('.vercel.app')
+}
+
+export function hasBuildTimeNextPublicApiUrl(): boolean {
+  return Boolean(String(process.env.NEXT_PUBLIC_API_URL || '').trim())
+}

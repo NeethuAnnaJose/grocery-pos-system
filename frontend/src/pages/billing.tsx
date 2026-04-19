@@ -3,7 +3,13 @@ import toast from 'react-hot-toast'
 import { AppHeader } from '@/components/AppHeader'
 import { useRequireAuth } from '@/hooks/useRequireAuth'
 import { authAPI, itemsAPI, ordersAPI, productAPI } from '@/services/api'
-import { getStoredApiOrigin, setStoredApiOrigin } from '@/lib/apiOrigin'
+import {
+  getStoredApiOrigin,
+  setStoredApiOrigin,
+  isBlockedExampleApiOrigin,
+  isVercelLiveSite,
+  hasBuildTimeNextPublicApiUrl,
+} from '@/lib/apiOrigin'
 
 /**
  * Mall-style billing counter: products live in the store DB (same API as POS).
@@ -78,6 +84,7 @@ export default function BillingPage() {
   const [loginSubmitting, setLoginSubmitting] = useState(false)
   /** Saved to localStorage as SHOPPOS_API_ORIGIN so the browser can reach your API (Vercel / mobile). */
   const [apiBackendDraft, setApiBackendDraft] = useState('')
+  const [showVercelApiHint, setShowVercelApiHint] = useState(false)
 
   const [catalog, setCatalog] = useState<CatalogItem[]>([])
   const [cart, setCart] = useState<BillLine[]>([])
@@ -129,9 +136,18 @@ export default function BillingPage() {
   }, [catalog])
 
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      setApiBackendDraft(getStoredApiOrigin())
+    if (typeof window === 'undefined') return
+    let initial = getStoredApiOrigin()
+    if (initial && isBlockedExampleApiOrigin(initial)) {
+      setStoredApiOrigin('')
+      initial = ''
+      toast.error(
+        'Removed the example API address from this browser. Paste your real backend URL below (from Render, Railway, etc.).',
+        { id: 'billing-cleared-bad-api', duration: 8000 }
+      )
     }
+    setApiBackendDraft(initial)
+    setShowVercelApiHint(isVercelLiveSite() && !hasBuildTimeNextPublicApiUrl())
   }, [])
 
   useEffect(() => {
@@ -147,7 +163,7 @@ export default function BillingPage() {
         if (err?.response?.status === 401) {
           localStorage.removeItem('token')
           setStoreToken('')
-          toast.error('Store session expired. Sign in again with your staff account.')
+          toast.error('Store session expired. Sign in again with your staff account.', { id: 'billing-session-expired' })
         }
       })
   }, [])
@@ -199,10 +215,10 @@ export default function BillingPage() {
       if (Array.isArray(cached) && cached.length) {
         setCatalog(cached)
         setIsOffline(true)
-        toast.error('Using offline product cache. Reconnect and refresh.')
+        toast.error('Using offline product cache. Reconnect and refresh.', { id: 'billing-catalog-offline' })
       } else {
         setCatalog([])
-        toast.error('Could not load product catalog. Check API login and server.')
+        toast.error('Could not load product catalog. Check API login and server.', { id: 'billing-catalog-fail' })
       }
     } finally {
       setLoadingCatalog(false)
@@ -217,17 +233,37 @@ export default function BillingPage() {
     e.preventDefault()
     const email = staffEmail.trim().toLowerCase()
     if (!email || !staffPassword) {
-      toast.error('Enter staff email and password (same as POS / store server).')
+      toast.error('Enter staff email and password (same as POS / store server).', { id: 'billing-login-validate' })
+      return
+    }
+    const apiDraft = apiBackendDraft.trim()
+    if (isBlockedExampleApiOrigin(apiDraft)) {
+      toast.error(
+        'That is a placeholder URL, not your API. Paste the real address from your host (e.g. https://something.onrender.com). Test it: open YOUR_URL/api/health in a new tab — you should see JSON with status OK.',
+        { id: 'billing-bad-api-placeholder', duration: 9000 }
+      )
+      return
+    }
+    const onVercel = isVercelLiveSite()
+    const hasBuildApi = hasBuildTimeNextPublicApiUrl()
+    const hasSavedOrDraft = Boolean(getStoredApiOrigin() || apiDraft)
+    if (onVercel && !hasBuildApi && !hasSavedOrDraft) {
+      toast.error(
+        'On Vercel you must set Backend API URL to your deployed Node API (same URL where the backend runs), or set NEXT_PUBLIC_API_URL in Vercel project env and redeploy.',
+        { id: 'billing-vercel-needs-api', duration: 10000 }
+      )
       return
     }
     setLoginSubmitting(true)
     try {
-      setStoredApiOrigin(apiBackendDraft.trim())
+      if (apiDraft) {
+        setStoredApiOrigin(apiDraft)
+      }
       const response = await authAPI.login({ email, password: staffPassword })
       const body = response.data
       const token = body?.data?.token
       if (!token) {
-        toast.error(body?.message || 'Login failed')
+        toast.error(body?.message || 'Login failed', { id: 'billing-login-no-token' })
         return
       }
       localStorage.setItem('token', token)
@@ -239,14 +275,17 @@ export default function BillingPage() {
       const msg = apiErrorMessage(err, 'Store login failed')
       if (!err?.response) {
         toast.error(
-          'Cannot reach store server. Start the backend (e.g. port 5000), set frontend .env NEXT_PUBLIC_API_URL to that URL, then try again.'
+          onVercel
+            ? 'Cannot reach your API. Paste the correct Backend API URL (HTTPS, no /api suffix), save by connecting again, and confirm that URL/api/health works in a new browser tab.'
+            : 'Cannot reach store server. Start the backend (e.g. port 5000), set frontend .env NEXT_PUBLIC_API_URL to that URL, then try again.',
+          { id: 'billing-login-network', duration: 9000 }
         )
       } else {
         const hint =
           /invalid credentials/i.test(msg) || /invalid credential/i.test(msg)
             ? ' Use the database staff password (after seed: staff@shop.com / staff123). This is not the same as the optional local counter login on /login.'
             : ''
-        toast.error(`${msg}${hint}`)
+        toast.error(`${msg}${hint}`, { id: 'billing-login-server', duration: 7000 })
       }
     } finally {
       setLoginSubmitting(false)
@@ -758,20 +797,40 @@ export default function BillingPage() {
               Products and stock are loaded from your <strong>store database</strong> (same as POS). Sign in with the
               staff account you use for the POS server so scanning matches shelf barcodes.
             </p>
+            {showVercelApiHint && (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+                <strong className="font-semibold">Live site (Vercel):</strong> this page must know where your Node API is hosted.
+                Paste your real API base below (the same origin that opens your backend — often <code className="text-xs bg-amber-100 px-1 rounded">https://…onrender.com</code>).
+                Do <strong>not</strong> leave the tutorial placeholder. In a new tab, open <code className="text-xs bg-amber-100 px-1 rounded">YOUR_URL/api/health</code> — it must return JSON before you sign in here.
+              </div>
+            )}
             <form onSubmit={handleStaffLogin} className="space-y-3">
               <div>
-                <label className="block text-xs font-medium text-gray-700 mb-1">Backend API URL (if login fails on live / phone)</label>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  Backend API URL <span className="text-red-600">{showVercelApiHint ? '(required here if not set in Vercel env)' : '(if login fails on live / phone)'}</span>
+                </label>
                 <input
                   className="input w-full text-sm"
                   type="url"
                   inputMode="url"
-                  placeholder="https://your-api.onrender.com"
+                  placeholder="https://my-backend-xxxx.onrender.com"
                   value={apiBackendDraft}
                   onChange={(e) => setApiBackendDraft(e.target.value)}
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  No <code className="bg-slate-100 px-0.5 rounded">/api</code> suffix. Saved in this browser only. Clear the field and save with empty to reset.
+                  Origin only — no <code className="bg-slate-100 px-0.5 rounded">/api</code> at the end. Filled values are saved when you connect. Leaving the field empty keeps any URL you saved earlier.
                 </p>
+                <button
+                  type="button"
+                  className="text-xs text-blue-600 underline mt-1"
+                  onClick={() => {
+                    setStoredApiOrigin('')
+                    setApiBackendDraft('')
+                    toast.success('Saved API URL cleared for this browser.')
+                  }}
+                >
+                  Clear saved API URL
+                </button>
               </div>
               <input
                 className="input w-full"

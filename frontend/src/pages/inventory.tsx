@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter } from 'next/router'
 import toast from 'react-hot-toast'
 import { BinaryBitmap, BarcodeFormat, DecodeHintType, HybridBinarizer, MultiFormatReader, RGBLuminanceSource } from '@zxing/library'
 import { drawVideoToDecodeCanvas } from '@/lib/drawVideoToDecodeCanvas'
@@ -14,6 +15,7 @@ import {
 } from '@/services/inventoryFirebase'
 import { hasFirebaseConfig } from '@/lib/firebase'
 import { loadInventoryFromLocal, mergeInventoryLists, saveInventoryToLocal } from '@/services/inventoryLocalStore'
+import { itemsAPI, productAPI } from '@/services/api'
 
 type FormState = {
   name: string
@@ -56,7 +58,19 @@ const itemMatchesBarcode = (item: InventoryItem, scannedValue: string) => {
   return barcodeCandidates(scannedValue).some((candidate) => itemCodes.has(candidate))
 }
 
+const getStoreJwt = () => (typeof window !== 'undefined' ? localStorage.getItem('token') : null)
+
+const mapApiRowToInventoryItem = (row: any): InventoryItem => ({
+  id: row.id,
+  name: row.name || '',
+  barcode: String(row.barcode || ''),
+  price: Number(row.price || 0),
+  quantity: Number(row.quantity || 0),
+  unit: row.unit || 'pcs',
+})
+
 export default function InventoryPage() {
+  const router = useRouter()
   const { authLoading, currentUserEmail } = useRequireAuth()
   const [items, setItems] = useState<InventoryItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -87,6 +101,7 @@ export default function InventoryPage() {
   const lastQuaggaAttemptRef = useRef(0)
   const zxingReaderRef = useRef<MultiFormatReader | null>(null)
   const itemsRef = useRef<InventoryItem[]>([])
+  const itemCategoryIdsRef = useRef<Map<string, string>>(new Map())
   const scannerBufferRef = useRef('')
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -111,12 +126,26 @@ export default function InventoryPage() {
 
   const cacheItems = (nextItems: InventoryItem[]) => {
     setItems(nextItems)
-    saveInventoryToLocal(nextItems)
+    if (!getStoreJwt()) {
+      saveInventoryToLocal(nextItems)
+    }
   }
 
-  const loadItems = async () => {
+  const loadItems = useCallback(async () => {
     try {
       setLoading(true)
+      const token = getStoreJwt()
+      if (token) {
+        itemCategoryIdsRef.current.clear()
+        const response = await itemsAPI.getItems({ limit: 2000 })
+        const rows = Array.isArray(response.data?.data?.items) ? response.data.data.items : []
+        for (const r of rows) {
+          if (r?.id && r?.categoryId) itemCategoryIdsRef.current.set(r.id, r.categoryId)
+        }
+        setItems(rows.map(mapApiRowToInventoryItem))
+        return
+      }
+
       const local = loadInventoryFromLocal()
       if (local.length) {
         setItems(local)
@@ -143,14 +172,25 @@ export default function InventoryPage() {
           toast.error(error?.message || 'Failed to load inventory')
         }
       }
+    } catch {
+      if (getStoreJwt()) {
+        toast.error('Could not load store inventory. Sign in on Billing (store login) first, then refresh.')
+        setItems([])
+      }
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
-    loadItems()
-  }, [])
+    void loadItems()
+  }, [loadItems])
+
+  useEffect(() => {
+    const onRoute = () => void loadItems()
+    router.events.on('routeChangeComplete', onRoute)
+    return () => router.events.off('routeChangeComplete', onRoute)
+  }, [router.events, loadItems])
 
   useEffect(() => {
     itemsRef.current = items
@@ -540,39 +580,82 @@ export default function InventoryPage() {
     setIsSaving(true)
     if (editingId) {
       try {
-        await updateInventoryItem(editingId, { name, barcode, price, quantity, unit })
-        const next = items.map((item) =>
-          item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
-        )
-        cacheItems(next)
-        toast.success('Item updated')
+        if (getStoreJwt()) {
+          const categoryId = itemCategoryIdsRef.current.get(editingId)
+          const res = await itemsAPI.updateItem(editingId, {
+            name,
+            barcode,
+            price,
+            costPrice: price,
+            quantity,
+            unit,
+            ...(categoryId ? { categoryId } : {}),
+          })
+          const updated = res.data?.data?.item
+          const prevRow = items.find((i) => i.id === editingId)
+          const mapped = updated
+            ? mapApiRowToInventoryItem(updated)
+            : prevRow
+              ? { ...prevRow, name, barcode, price, quantity, unit }
+              : mapApiRowToInventoryItem({ id: editingId, name, barcode, price, quantity, unit })
+          if (updated?.categoryId) itemCategoryIdsRef.current.set(editingId, updated.categoryId)
+          const next = items.map((item) => (item.id === editingId ? mapped : item))
+          setItems(next)
+          toast.success('Item updated')
+        } else {
+          await updateInventoryItem(editingId, { name, barcode, price, quantity, unit })
+          const next = items.map((item) =>
+            item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
+          )
+          cacheItems(next)
+          toast.success('Item updated')
+        }
       } catch (error: any) {
-        // Keep local cache updated even when Firebase is unavailable.
-        const next = items.map((item) =>
-          item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
-        )
-        cacheItems(next)
-        toast.error(error?.message || 'Firebase update failed. Updated locally.')
+        if (getStoreJwt()) {
+          toast.error(error?.response?.data?.message || error?.message || 'Update failed')
+        } else {
+          const next = items.map((item) =>
+            item.id === editingId ? { ...item, name, barcode, price, quantity, unit } : item
+          )
+          cacheItems(next)
+          toast.error(error?.message || 'Firebase update failed. Updated locally.')
+        }
       }
     } else {
       try {
-        const created = await createInventoryItem({ name, barcode, price, quantity, unit })
-        cacheItems([created, ...items])
-        toast.success('Item added')
-      } catch (error: any) {
-        // Keep local cache updated even when Firebase is unavailable.
-        const localItem: InventoryItem = {
-          id: `local-${Date.now()}`,
-          name,
-          barcode,
-          price,
-          quantity,
-          unit,
-          createdAt: null,
-          updatedAt: null,
+        if (getStoreJwt()) {
+          await productAPI.createProduct({
+            name,
+            barcode,
+            price,
+            costPrice: price,
+            quantity,
+            unit,
+          })
+          await loadItems()
+          toast.success('Item added to store')
+        } else {
+          const created = await createInventoryItem({ name, barcode, price, quantity, unit })
+          cacheItems([created, ...items])
+          toast.success('Item added')
         }
-        cacheItems([localItem, ...items])
-        toast.error(error?.message || 'Firebase add failed. Saved locally.')
+      } catch (error: any) {
+        if (getStoreJwt()) {
+          toast.error(error?.response?.data?.message || error?.message || 'Could not add item')
+        } else {
+          const localItem: InventoryItem = {
+            id: `local-${Date.now()}`,
+            name,
+            barcode,
+            price,
+            quantity,
+            unit,
+            createdAt: null,
+            updatedAt: null,
+          }
+          cacheItems([localItem, ...items])
+          toast.error(error?.message || 'Firebase add failed. Saved locally.')
+        }
       }
     }
 
@@ -587,20 +670,30 @@ export default function InventoryPage() {
     if (!item) return
     if (!window.confirm(`Delete "${item.name}"?`)) return
     try {
-      await deleteInventoryItem(itemId)
-      cacheItems(items.filter((entry) => entry.id !== itemId))
+      if (getStoreJwt()) {
+        await itemsAPI.deleteItem(itemId)
+        itemCategoryIdsRef.current.delete(itemId)
+        setItems(items.filter((entry) => entry.id !== itemId))
+      } else {
+        await deleteInventoryItem(itemId)
+        cacheItems(items.filter((entry) => entry.id !== itemId))
+      }
       if (editingId === itemId) {
         setEditingId(null)
         setForm(emptyForm)
       }
       toast.success('Item deleted')
     } catch (error: any) {
-      cacheItems(items.filter((entry) => entry.id !== itemId))
-      if (editingId === itemId) {
-        setEditingId(null)
-        setForm(emptyForm)
+      if (getStoreJwt()) {
+        toast.error(error?.response?.data?.message || error?.message || 'Delete failed')
+      } else {
+        cacheItems(items.filter((entry) => entry.id !== itemId))
+        if (editingId === itemId) {
+          setEditingId(null)
+          setForm(emptyForm)
+        }
+        toast.error(error?.message || 'Firebase delete failed. Removed locally.')
       }
-      toast.error(error?.message || 'Firebase delete failed. Removed locally.')
     }
   }
 
@@ -618,6 +711,22 @@ export default function InventoryPage() {
           <p className="text-sm text-gray-600 mt-1">
             Add or update stock here. Scanning here only fills barcode/item details.
           </p>
+          {getStoreJwt() ? (
+            <p className="text-sm text-green-800 bg-green-50 border border-green-200 rounded-lg px-3 py-2 mt-3">
+              <strong>Store database mode:</strong> this list is the same catalog as <strong>POS</strong> and{' '}
+              <strong>Billing</strong> (PostgreSQL). Scans on Billing will find these products.
+            </p>
+          ) : (
+            <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-3">
+              <strong>Local / Firebase mode:</strong> products here are{' '}
+              <strong>not</strong> the same as Billing or POS until you sign in to the store. Open{' '}
+              <a href="/billing" className="text-blue-700 underline font-medium">
+                Billing
+              </a>
+              , use <strong>Connect store</strong> (staff login), then return here — the page will load your real shop
+              inventory.
+            </p>
+          )}
         </section>
 
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 space-y-3 border border-slate-200">
