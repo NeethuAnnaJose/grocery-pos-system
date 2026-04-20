@@ -328,17 +328,27 @@ export default function POS() {
         ctx.resume().catch(() => {})
       }
 
-      const osc = ctx.createOscillator()
       const gain = ctx.createGain()
-      osc.type = 'sine'
-      osc.frequency.value = type === 'success' ? 920 : 720
       gain.gain.setValueAtTime(0.0001, ctx.currentTime)
-      gain.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + 0.01)
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.09)
-      osc.connect(gain)
+      gain.gain.exponentialRampToValueAtTime(type === 'success' ? 0.34 : 0.22, ctx.currentTime + 0.01)
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (type === 'success' ? 0.2 : 0.14))
       gain.connect(ctx.destination)
-      osc.start()
-      osc.stop(ctx.currentTime + 0.1)
+
+      const oscA = ctx.createOscillator()
+      oscA.type = 'square'
+      oscA.frequency.value = type === 'success' ? 1280 : 860
+      oscA.connect(gain)
+      oscA.start()
+      oscA.stop(ctx.currentTime + (type === 'success' ? 0.1 : 0.07))
+
+      if (type === 'success') {
+        const oscB = ctx.createOscillator()
+        oscB.type = 'square'
+        oscB.frequency.value = 1080
+        oscB.connect(gain)
+        oscB.start(ctx.currentTime + 0.1)
+        oscB.stop(ctx.currentTime + 0.2)
+      }
       if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
         navigator.vibrate(type === 'success' ? 40 : 20)
       }

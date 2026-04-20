@@ -32,6 +32,7 @@ type BillLine = {
   quantity: number
   barcode?: string
   unit?: string
+  isManual?: boolean
 }
 
 const BILL_CACHE_KEY = 'billing_counter_cart_v2'
@@ -89,6 +90,7 @@ export default function BillingPage() {
   const [catalog, setCatalog] = useState<CatalogItem[]>([])
   const [cart, setCart] = useState<BillLine[]>([])
   const [manualEntry, setManualEntry] = useState('')
+  const [manualItem, setManualItem] = useState({ name: '', price: '', quantity: '1' })
   const [loadingCatalog, setLoadingCatalog] = useState(false)
 
   const [showScanner, setShowScanner] = useState(false)
@@ -121,6 +123,8 @@ export default function BillingPage() {
   const scannerBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const cartRef = useRef<BillLine[]>([])
   const catalogRef = useRef<CatalogItem[]>([])
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const lastBeepAtRef = useRef(0)
 
   const cartTotal = useMemo(
     () => cart.reduce((sum, line) => sum + Number(line.price || 0) * Number(line.quantity || 0), 0),
@@ -395,6 +399,7 @@ export default function BillingPage() {
       if (product) {
         const ok = await addLineToBill(product)
         if (ok) {
+          playScanBeep()
           setScanStatus(`Added: ${product.name}`)
           toast.success(`Added: ${product.name}`)
           setShowScanner(false)
@@ -403,7 +408,7 @@ export default function BillingPage() {
       } else {
         setScanStatus(`Not in catalog: ${normalizedCode}`)
         toast.error(`No product for barcode ${normalizedCode}`)
-        if (source === 'camera') {
+        if (showScanner || source === 'camera') {
           setShowScanner(false)
           stopScanner()
         }
@@ -441,6 +446,31 @@ export default function BillingPage() {
     toast.error('Product not found. Add it in POS / inventory admin first.')
   }
 
+  const addManualItemToBill = () => {
+    const name = manualItem.name.trim()
+    const price = Number(manualItem.price)
+    const quantity = Number(manualItem.quantity)
+    if (!name) {
+      toast.error('Enter manual item name')
+      return
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      toast.error('Enter valid manual item price')
+      return
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      toast.error('Enter valid manual item quantity')
+      return
+    }
+    const id = `manual-${Date.now()}`
+    setCart((prev) => [
+      ...prev,
+      { id, name, price, quantity, barcode: 'MANUAL', unit: 'pcs', isManual: true },
+    ])
+    setManualItem({ name: '', price: '', quantity: '1' })
+    toast.success('Manual item added to bill')
+  }
+
   const isExpectedDecodeMiss = (error: any) => {
     const name = String(error?.name || '')
     const message = String(error?.message || '')
@@ -449,6 +479,65 @@ export default function BillingPage() {
       /no multiformat readers were able to detect the code/i.test(message) ||
       /not found/i.test(message)
     )
+  }
+
+  const playScanBeep = () => {
+    try {
+      const now = Date.now()
+      if (now - lastBeepAtRef.current < 100) return
+      lastBeepAtRef.current = now
+      const AudioCtx =
+        typeof window !== 'undefined'
+          ? ((window as any).AudioContext || (window as any).webkitAudioContext)
+          : null
+      if (!AudioCtx) return
+      if (!audioContextRef.current) audioContextRef.current = new AudioCtx()
+      const ctx = audioContextRef.current
+      if (!ctx) return
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {})
+
+      const gain = ctx.createGain()
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + 0.01)
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.2)
+      gain.connect(ctx.destination)
+
+      const oscA = ctx.createOscillator()
+      oscA.type = 'square'
+      oscA.frequency.value = 1400
+      oscA.connect(gain)
+      oscA.start()
+      oscA.stop(ctx.currentTime + 0.09)
+
+      const oscB = ctx.createOscillator()
+      oscB.type = 'square'
+      oscB.frequency.value = 1100
+      oscB.connect(gain)
+      oscB.start(ctx.currentTime + 0.1)
+      oscB.stop(ctx.currentTime + 0.2)
+
+      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+        navigator.vibrate([35, 20, 35])
+      }
+    } catch {
+      // ignore audio failures
+    }
+  }
+
+  const unlockAudio = async () => {
+    try {
+      const AudioCtx =
+        typeof window !== 'undefined'
+          ? ((window as any).AudioContext || (window as any).webkitAudioContext)
+          : null
+      if (!AudioCtx) return
+      if (!audioContextRef.current) audioContextRef.current = new AudioCtx()
+      const ctx = audioContextRef.current
+      if (!ctx) return
+      if (ctx.state === 'suspended') await ctx.resume()
+    } catch {
+      // optional
+    }
   }
 
   const stopScanner = () => {
@@ -629,6 +718,7 @@ export default function BillingPage() {
       if (event.key === 'F8') {
         event.preventDefault()
         if (!storeToken) return
+        void unlockAudio()
         setShowScanner(true)
         setTimeout(() => void startScanner(), 0)
         return
@@ -675,6 +765,11 @@ export default function BillingPage() {
     const q = Math.max(0, Math.floor(nextQty))
     const delta = q - line.quantity
     if (delta === 0) return
+    if (line.isManual) {
+      if (q <= 0) setCart((prev) => prev.filter((l) => l.id !== lineId))
+      else setCart((prev) => prev.map((l) => (l.id === lineId ? { ...l, quantity: q } : l)))
+      return
+    }
     const cat = catalogRef.current.find((c) => c.id === lineId)
     if (!cat) return
     try {
@@ -711,6 +806,7 @@ export default function BillingPage() {
     const lines = cartRef.current
     if (!lines.length) return
     for (const line of lines) {
+      if (line.isManual) continue
       try {
         await itemsAPI.updateStock(line.id, {
           quantity: line.quantity,
@@ -730,6 +826,10 @@ export default function BillingPage() {
   const completeSale = async () => {
     if (!cart.length) {
       toast.error('Bill is empty')
+      return
+    }
+    if (cart.some((l) => l.isManual)) {
+      toast.error('Manual items are for quick bill/print only. Remove them before Complete sale.')
       return
     }
     setIsCheckoutLoading(true)
@@ -767,7 +867,7 @@ export default function BillingPage() {
     const rows = cart
       .map((line) => {
         const t = line.price * line.quantity
-        return `<tr><td style="border:1px solid #ddd;padding:6px;">${line.name}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.quantity}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.price.toFixed(2)}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${t.toFixed(2)}</td></tr>`
+        return `<tr><td style="border:1px solid #ddd;padding:6px;">${line.name}${line.isManual ? ' (Manual)' : ''}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.quantity}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${line.price.toFixed(2)}</td><td style="border:1px solid #ddd;padding:6px;text-align:right;">${t.toFixed(2)}</td></tr>`
       })
       .join('')
     const html = `<html><head><title>Bill</title></head><body style="font-family:Arial,sans-serif;padding:16px;"><h2>Bill</h2><p>${new Date().toLocaleString()}</p><table style="width:100%;border-collapse:collapse;"><thead><tr><th style="border:1px solid #ddd;padding:6px;">Item</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Qty</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Price</th><th style="border:1px solid #ddd;padding:6px;text-align:right;">Total</th></tr></thead><tbody>${rows}</tbody></table><h3 style="text-align:right;">Total: Rs ${cartTotal.toFixed(2)}</h3></body></html>`
@@ -893,6 +993,14 @@ export default function BillingPage() {
               {loadingCatalog ? 'Loading catalog…' : `${catalog.length} products`}
               {isOffline && <span className="text-amber-600 ml-2">(offline cache)</span>}
             </p>
+            <div className="mt-2 flex flex-wrap gap-2 text-xs">
+              <span className="px-2 py-1 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                Items in bill: {cart.reduce((s, l) => s + l.quantity, 0)}
+              </span>
+              <span className="px-2 py-1 rounded-full bg-violet-50 text-violet-700 border border-violet-200">
+                Manual lines: {cart.filter((l) => l.isManual).length}
+              </span>
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             <button type="button" className="btn btn-outline btn-sm" onClick={() => void loadCatalog()} disabled={loadingCatalog}>
@@ -934,6 +1042,7 @@ export default function BillingPage() {
               type="button"
               className="btn btn-secondary min-w-32"
               onClick={() => {
+                void unlockAudio()
                 setShowScanner(true)
                 setTimeout(() => void startScanner(), 0)
               }}
@@ -943,6 +1052,35 @@ export default function BillingPage() {
             </button>
           </div>
           <p className="text-xs text-gray-500">USB scanner: scan barcode then Enter. Camera: F8 or Scan to bill.</p>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-2 pt-2 border-t border-slate-100">
+            <input
+              className="input"
+              placeholder="Manual item name"
+              value={manualItem.name}
+              onChange={(e) => setManualItem((prev) => ({ ...prev, name: e.target.value }))}
+            />
+            <input
+              className="input"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="Manual price"
+              value={manualItem.price}
+              onChange={(e) => setManualItem((prev) => ({ ...prev, price: e.target.value }))}
+            />
+            <input
+              className="input"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="Qty"
+              value={manualItem.quantity}
+              onChange={(e) => setManualItem((prev) => ({ ...prev, quantity: e.target.value }))}
+            />
+            <button type="button" className="btn btn-outline" onClick={addManualItemToBill}>
+              Add manual item
+            </button>
+          </div>
         </section>
 
         <section className="bg-white/95 backdrop-blur rounded-xl shadow p-5 border border-slate-200">
@@ -969,7 +1107,14 @@ export default function BillingPage() {
               {cart.map((line) => (
                 <div key={line.id} className="border rounded p-2 flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="font-medium">{line.name}</div>
+                    <div className="font-medium">
+                      {line.name}
+                      {line.isManual ? (
+                        <span className="ml-2 text-[11px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">
+                          Manual
+                        </span>
+                      ) : null}
+                    </div>
                     <div className="text-xs text-gray-600">{line.barcode || '—'}</div>
                   </div>
                   <div className="flex items-center gap-2">
